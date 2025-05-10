@@ -2,19 +2,58 @@
 import sys
 import json
 import os
+import sqlite3
+import random
 from datetime import datetime
-from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
-                            QHBoxLayout, QLabel, QPushButton, QLineEdit, 
+import time
+from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
+                            QLabel, QPushButton, QLineEdit, 
                             QListWidget, QListWidgetItem, QTabWidget, QTextEdit,
                             QScrollArea, QFrame, QSplitter, QMessageBox, QComboBox,
-                            QDialog, QCheckBox, QSizePolicy)
-from PyQt5.QtCore import Qt, QSize, pyqtSignal
-from PyQt5.QtGui import QFont, QColor, QIcon, QPalette
+                            QDialog, QCheckBox, QSizePolicy, QSlider, QColorDialog,
+                            QFileDialog, QProgressBar, QRadioButton, QButtonGroup)
+from PyQt5.QtCore import Qt, QSize, pyqtSignal, QTimer, QPropertyAnimation, QEasingCurve
+from PyQt5.QtGui import QFont, QColor, QIcon, QPalette, QPixmap, QImage, QPainter, QBrush, QLinearGradient
 import subprocess
 
 # Constants
 TODO_FILE = "todos.json"
+DB_FILE = "chatmate.db"
 CATEGORIES = ["To Do", "Ongoing", "Done", "Waiting", "Someday"]
+
+# AI Moods
+AI_MOODS = {
+    "professional": {
+        "name": "Professional",
+        "description": "Formal and business-like responses",
+        "color": "#4a90e2",
+        "system_prompt": "You are a professional assistant providing clear, accurate information in a formal tone."
+    },
+    "friendly": {
+        "name": "Friendly",
+        "description": "Warm and conversational responses",
+        "color": "#50c878",
+        "system_prompt": "You are a friendly assistant having a casual conversation. Be warm, approachable and occasionally use emojis."
+    },
+    "creative": {
+        "name": "Creative",
+        "description": "Imaginative and artistic responses",
+        "color": "#9370db",
+        "system_prompt": "You are a creative assistant with an artistic flair. Use metaphors, vivid descriptions, and think outside the box."
+    },
+    "concise": {
+        "name": "Concise",
+        "description": "Brief and to-the-point responses",
+        "color": "#ff7f50",
+        "system_prompt": "You are a concise assistant. Provide brief, direct answers with minimal elaboration."
+    },
+    "technical": {
+        "name": "Technical",
+        "description": "Detailed technical responses",
+        "color": "#607d8b",
+        "system_prompt": "You are a technical assistant with deep expertise. Provide detailed, technical explanations with precise terminology."
+    }
+}
 
 # Theme definitions
 THEMES = {
@@ -181,19 +220,60 @@ class ChatbotAPI:
     
     def __init__(self, base_url="http://localhost:11434"):
         self.base_url = base_url
-        # Select the 5 smallest models based on the ollama list output
+        # Default models if none are found
         self.models = ["llama3.2", "phi3", "mistral", "codellama", "gemma2"]
         self.available_models = []
         self.current_model_index = 0
         self.model = self.models[self.current_model_index] if self.models else None
         self.offline_mode = False
         self.model_sizes = {}
+        self.model_capabilities = {}  # Store capabilities for each model
         self.online_api = OnlineAIAPI()
         self.use_online_api = False
+        self.current_mood = "professional"  # Default mood
+        
+        # Models known to support image generation
+        self.image_capable_models = [
+            "llava", "bakllava", "llava-llama3", "llava-phi3", "moondream",
+            "cogvlm", "dall-e", "stable-diffusion", "midjourney", "sdxl",
+            "pixart", "kandinsky", "playground", "deepfloyd", "imagen"
+        ]
+        
+        self.local_model_paths = [
+            "/home/udaysingh/.ollama/models",  # Default Ollama path
+            "/usr/local/share/ollama/models",  # System-wide Ollama models
+            os.path.expanduser("~/models"),  # User's models directory
+            os.path.expanduser("~/.local/share/models")  # Alternative location
+        ]
         self.get_available_models()
         
     def get_available_models(self):
-        """Get list of available models from Ollama"""
+        """Get list of available models from Ollama and local directories"""
+        import subprocess
+        import json
+        import glob
+        import os
+        
+        # First try to get models from Ollama API
+        ollama_models_found = self.get_ollama_models()
+        
+        # If no Ollama models found, scan local directories for model files
+        if not ollama_models_found or not self.available_models:
+            self.scan_local_model_directories()
+        
+        # If we have models, set the current one
+        if self.available_models:
+            self.models = self.available_models[:10]  # Take up to 10 models
+            self.model = self.models[0]
+            self.current_model_index = 0
+            self.offline_mode = False
+            return True
+        else:
+            # No models found, stay with defaults
+            return False
+    
+    def get_ollama_models(self):
+        """Get models from Ollama API"""
         import subprocess
         import json
         
@@ -209,24 +289,27 @@ class ChatbotAPI:
                     # Extract model names and sizes
                     self.available_models = []
                     self.model_sizes = {}
+                    self.model_capabilities = {}
                     
                     for model in models_data:
                         name = model.get('name', '').split(':')[0]
                         size = model.get('size', 0)
                         self.model_sizes[name] = size
                         self.available_models.append(name)
+                        
+                        # Check if model supports image generation
+                        supports_images = any(img_model in name.lower() for img_model in self.image_capable_models)
+                        self.model_capabilities[name] = {
+                            "image_generation": supports_images,
+                            "size_mb": size / (1024 * 1024) if size > 0 else 0
+                        }
+                    
+                    # Get more detailed model info for each model
+                    self.get_model_details()
                     
                     # Sort models by size (smallest first)
                     self.available_models.sort(key=lambda x: self.model_sizes.get(x, float('inf')))
-                    
-                    # Take the 5 smallest models or fewer if less are available
-                    self.models = self.available_models[:5] if self.available_models else self.models
-                    
-                    if self.models:
-                        self.model = self.models[0]
-                        self.current_model_index = 0
-                        self.offline_mode = False
-                        return True
+                    return True
                 except json.JSONDecodeError:
                     # Fallback to text parsing if JSON fails
                     return self.parse_ollama_list_text(result.stdout)
@@ -235,6 +318,157 @@ class ChatbotAPI:
                 
         except (subprocess.SubprocessError, FileNotFoundError):
             return self.check_ollama_status()
+            
+    def get_model_details(self):
+        """Get detailed information about each model"""
+        import subprocess
+        import json
+        import time
+        
+        for model_name in self.available_models:
+            try:
+                # Try to get model details using ollama show
+                result = subprocess.run(["ollama", "show", model_name, "--json"], 
+                                      capture_output=True, text=True, check=False,
+                                      timeout=2)  # Short timeout to avoid hanging
+                
+                if result.returncode == 0 and result.stdout:
+                    try:
+                        model_info = json.loads(result.stdout)
+                        
+                        # Extract capabilities
+                        if "details" in model_info:
+                            # Check for multimodal capability
+                            is_multimodal = "vision" in model_info.get("details", {}).get("capabilities", [])
+                            if is_multimodal:
+                                self.model_capabilities[model_name]["image_generation"] = True
+                                
+                            # Check for image generation in model description
+                            model_desc = model_info.get("details", {}).get("description", "").lower()
+                            if any(term in model_desc for term in ["image", "visual", "vision", "multimodal", "picture"]):
+                                self.model_capabilities[model_name]["image_generation"] = True
+                    except json.JSONDecodeError:
+                        pass
+            except (subprocess.SubprocessError, FileNotFoundError, TimeoutError):
+                # Skip if we can't get details
+                pass
+            
+            # Small delay to avoid overwhelming the system
+            time.sleep(0.1)
+    
+    def scan_local_model_directories(self):
+        """Scan local directories for model files and query Ollama for available models"""
+        import os
+        import glob
+        import subprocess
+        import json
+        import time
+        
+        # First, try to get all Ollama models directly using the API
+        try:
+            # Try direct API call to Ollama
+            import requests
+            response = requests.get(f"{self.base_url}/api/tags")
+            if response.status_code == 200:
+                models_data = response.json()
+                if "models" in models_data:
+                    for model in models_data["models"]:
+                        model_name = model.get("name", "").split(":")[0]  # Remove version tag if present
+                        if model_name and model_name not in self.available_models:
+                            self.available_models.append(model_name)
+                            # Check if model supports image generation based on name
+                            supports_images = any(img_model in model_name.lower() for img_model in self.image_capable_models)
+                            self.model_capabilities[model_name] = {
+                                "image_generation": supports_images,
+                                "size_mb": model.get("size", 0) / (1024 * 1024) if model.get("size", 0) > 0 else 1000,
+                                "source": "ollama_api"
+                            }
+        except Exception as e:
+            print(f"Error querying Ollama API: {e}")
+        
+        # Also try using the ollama CLI command
+        try:
+            result = subprocess.run(["ollama", "list"], capture_output=True, text=True, check=False, timeout=5)
+            if result.returncode == 0 and result.stdout:
+                # Parse the output
+                lines = result.stdout.strip().split('\n')
+                if len(lines) > 1:  # Skip header line
+                    for line in lines[1:]:  # Skip header
+                        parts = line.split()
+                        if parts:  # Ensure there's at least one part
+                            model_name = parts[0].split(":")[0]  # Get name without tag
+                            if model_name and model_name not in self.available_models:
+                                self.available_models.append(model_name)
+                                # Check if model supports image generation based on name
+                                supports_images = any(img_model in model_name.lower() for img_model in self.image_capable_models)
+                                self.model_capabilities[model_name] = {
+                                    "image_generation": supports_images,
+                                    "size_mb": 1000,  # Default size
+                                    "source": "ollama_cli"
+                                }
+        except Exception as e:
+            print(f"Error running ollama list command: {e}")
+        
+        # Model file extensions to look for
+        model_extensions = ["*.bin", "*.gguf", "*.ggml", "*.safetensors", "*.pt", "*.pth"]
+        
+        # Additional Ollama model paths to check
+        additional_ollama_paths = [
+            "/var/lib/ollama",  # System-wide Ollama installation
+            os.path.expanduser("~/.ollama"),  # User's Ollama directory
+            "/usr/share/ollama",  # Alternative system location
+            "/opt/ollama"  # Optional installation location
+        ]
+        
+        # Add additional paths to scan
+        for path in additional_ollama_paths:
+            if path not in self.local_model_paths:
+                self.local_model_paths.append(path)
+        
+        # Now scan local directories for model files
+        for path in self.local_model_paths:
+            if os.path.exists(path) and os.path.isdir(path):
+                # Look for model files with various extensions
+                for ext in model_extensions:
+                    try:
+                        model_files = glob.glob(os.path.join(path, "**", ext), recursive=True)
+                        
+                        for model_file in model_files:
+                            model_name = os.path.basename(model_file).split(".")[0]
+                            if model_name not in self.available_models:
+                                self.available_models.append(model_name)
+                                
+                                # Estimate size in MB
+                                try:
+                                    size_mb = os.path.getsize(model_file) / (1024 * 1024)
+                                    self.model_sizes[model_name] = size_mb
+                                except:
+                                    size_mb = 1000  # Default size if can't determine
+                                    self.model_sizes[model_name] = size_mb
+                                
+                                # Check if model supports image generation based on name
+                                supports_images = any(img_model in model_name.lower() for img_model in self.image_capable_models)
+                                
+                                # Also check if model file path contains hints about image capabilities
+                                file_path_lower = model_file.lower()
+                                if any(term in file_path_lower for term in ["vision", "multimodal", "image", "visual"]):
+                                    supports_images = True
+                                    
+                                self.model_capabilities[model_name] = {
+                                    "image_generation": supports_images,
+                                    "size_mb": size_mb,
+                                    "local_path": model_file,
+                                    "source": "file_scan"
+                                }
+                    except Exception as e:
+                        print(f"Error scanning {path} for {ext}: {e}")
+                        
+        # Sort available models alphabetically
+        self.available_models.sort()
+        
+        # Update models list with available models
+        if self.available_models:
+            self.models = self.available_models[:20]  # Limit to 20 models to avoid overwhelming the UI
     
     def parse_ollama_list_text(self, output):
         """Parse the text output of ollama list command"""
@@ -395,21 +629,310 @@ class ChatbotAPI:
     
     def get_offline_response(self, prompt):
         """Generate a response without using Ollama"""
-        # Simple rule-based responses for offline mode
-        prompt_lower = prompt.lower()
+        import random
         
-        if "hello" in prompt_lower or "hi" in prompt_lower:
-            return "Hello! I'm currently in offline mode, but I'm happy to help with basic todo management."
+        # Fallback responses for offline mode
+        fallback_responses = [
+            "I'm currently in offline mode. Please check if Ollama is running.",
+            "It seems I can't connect to the AI model right now. Please check your connection.",
+            "I'm having trouble accessing the language model. Please try again later.",
+            "The AI service appears to be unavailable at the moment. Please verify it's running.",
+            "I'm unable to process your request in offline mode. Please ensure Ollama is running."
+        ]
         
-        if "help" in prompt_lower:
-            return "I can help you manage your tasks. You can add new tasks, mark them as complete, or organize them into different categories."
+        return random.choice(fallback_responses)
         
-        if "task" in prompt_lower or "todo" in prompt_lower:
-            return "To manage your tasks, use the Todo List tab. You can add new tasks, change their status, or delete them as needed."
+    def can_generate_images(self):
+        """Check if the current model can generate images"""
+        if self.use_online_api:
+            # Check if online API supports image generation
+            return self.online_api.provider.lower() in ["openai", "anthropic", "stability", "midjourney"]
+        elif self.model in self.model_capabilities:
+            # Check local model capabilities
+            return self.model_capabilities[self.model].get("image_generation", False)
+        return False
         
-        if "thank" in prompt_lower:
-            return "You're welcome! Let me know if you need anything else."
+    def check_model_capabilities(self, model_name):
+        """Check detailed capabilities of a specific model by querying it"""
+        import os
+        import json
+        import requests
+        import time
+        import traceback
         
+        # Validate model name
+        if not model_name:
+            return {
+                "success": False,
+                "error": "No model name provided",
+                "capabilities": {"name": "Unknown"}
+            }
+        
+        # Handle case where model might not be in self.models but still valid
+        if model_name not in self.models and model_name not in self.available_models:
+            # Try to add it to available models
+            self.available_models.append(model_name)
+            self.models.append(model_name)
+            
+        # Initialize capabilities with basic info
+        model_info = self.model_capabilities.get(model_name, {})
+        source = model_info.get("source", "unknown")
+        
+        # Start with known capabilities or defaults
+        capabilities = {
+            "name": model_name,
+            "source": source,
+            "image_generation": model_info.get("image_generation", False),
+            "size_mb": model_info.get("size_mb", 0),
+            "check_time": time.strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        
+        # Flag to track if we got any meaningful data
+        got_meaningful_data = False
+        
+        # For Ollama models, try multiple methods to get capabilities
+        if source in ["ollama_api", "ollama_cli"] or source == "unknown":
+            # Method 1: Try Ollama API 'show' endpoint
+            try:
+                response = requests.post(
+                    f"{self.base_url}/api/show",
+                    json={"name": model_name},
+                    timeout=5
+                )
+                
+                if response.status_code == 200:
+                    model_data = response.json()
+                    if model_data:
+                        got_meaningful_data = True
+                        # Don't store the entire details object as it can be large
+                        if "parameters" in model_data:
+                            capabilities["parameters"] = model_data["parameters"]
+                        if "license" in model_data:
+                            capabilities["license"] = model_data["license"]
+                        if "template" in model_data:
+                            capabilities["has_template"] = True
+                        if "family" in model_data:
+                            capabilities["family"] = model_data["family"]
+                        
+                        # Extract model card info
+                        if "modelfile" in model_data:
+                            modelfile = model_data["modelfile"]
+                            lines = modelfile.split("\n")
+                            
+                            # Parse modelfile for capabilities
+                            for line in lines:
+                                if line.startswith("FROM "):
+                                    capabilities["base_model"] = line.replace("FROM ", "").strip()
+                                elif line.startswith("PARAMETER "):
+                                    param_line = line.replace("PARAMETER ", "").strip()
+                                    if " " in param_line:
+                                        param_name, param_value = param_line.split(" ", 1)
+                                        if "parameters" not in capabilities:
+                                            capabilities["parameters"] = {}
+                                        capabilities["parameters"][param_name] = param_value
+                                elif line.startswith("TEMPLATE "):
+                                    capabilities["has_template"] = True
+                                elif "vision" in line.lower() or "image" in line.lower() or "multimodal" in line.lower():
+                                    capabilities["image_generation"] = True
+                                    capabilities["vision_capable"] = True
+            except Exception as e:
+                # Just log the error and continue to other methods
+                print(f"Error getting model info from Ollama API: {str(e)}")
+                capabilities["api_error"] = str(e)
+            
+            # Method 2: Try to query the model directly if Method 1 failed or didn't provide enough info
+            if not got_meaningful_data or "self_reported" not in capabilities:
+                try:
+                    # Simple capability check prompt
+                    check_prompt = "What capabilities do you have? Can you process images or generate images? Please answer briefly."
+                    
+                    # Use a shorter timeout to avoid hanging
+                    response = requests.post(
+                        f"{self.base_url}/api/chat",
+                        json={
+                            "model": model_name,
+                            "messages": [
+                                {"role": "user", "content": check_prompt}
+                            ],
+                            "stream": False,
+                            "options": {"temperature": 0}
+                        },
+                        timeout=8
+                    )
+                    
+                    if response.status_code == 200:
+                        result = response.json()
+                        if "message" in result and "content" in result["message"]:
+                            got_meaningful_data = True
+                            capabilities["self_reported"] = result["message"]["content"]
+                            
+                            # Check for vision/image capabilities in the response
+                            response_text = result["message"]["content"].lower()
+                            if ("vision" in response_text or "image" in response_text) and \
+                               ("process" in response_text or "understand" in response_text or "analyze" in response_text):
+                                capabilities["vision_capable"] = True
+                            
+                            if "generate image" in response_text or "create image" in response_text:
+                                capabilities["image_generation"] = True
+                except Exception as e:
+                    # Just log the error and continue
+                    print(f"Error querying model: {str(e)}")
+                    capabilities["query_error"] = str(e)
+        
+        # For local file models, try to determine capabilities from the file path and name
+        if source == "file_scan" and "local_path" in model_info:
+            try:
+                file_path = model_info["local_path"]
+                if os.path.exists(file_path):
+                    got_meaningful_data = True
+                    file_name = os.path.basename(file_path).lower()
+                    
+                    # Check for vision/image capabilities in the file name or path
+                    if any(term in file_name or term in file_path.lower() for term in 
+                          ["vision", "vl", "visual", "multimodal", "multi-modal", "image"]):
+                        capabilities["vision_capable"] = True
+                        capabilities["image_generation"] = True
+                    
+                    # Try to determine model type from file extension
+                    file_ext = os.path.splitext(file_path)[1].lower()
+                    if file_ext in [".gguf", ".ggml"]:
+                        capabilities["model_type"] = "llama.cpp compatible"
+                    elif file_ext in [".safetensors"]:
+                        capabilities["model_type"] = "Hugging Face compatible"
+                    elif file_ext in [".pt", ".pth"]:
+                        capabilities["model_type"] = "PyTorch model"
+                    elif file_ext in [".bin"]:
+                        capabilities["model_type"] = "Binary model"
+                    
+                    # Try to determine model size from file size
+                    try:
+                        size_bytes = os.path.getsize(file_path)
+                        capabilities["size_mb"] = size_bytes / (1024 * 1024)
+                        capabilities["size_gb"] = size_bytes / (1024 * 1024 * 1024)
+                    except Exception as size_error:
+                        print(f"Error getting file size: {str(size_error)}")
+            except Exception as e:
+                print(f"Error checking file model: {str(e)}")
+        
+        # If we didn't get any meaningful data, try to infer from model name
+        if not got_meaningful_data:
+            # Infer capabilities from model name
+            model_lower = model_name.lower()
+            
+            # Check for common model families
+            if any(family in model_lower for family in ["llama", "mistral", "phi", "gemma", "gpt"]):
+                capabilities["model_family"] = "Large Language Model"
+            
+            # Check for vision capabilities in name
+            if any(term in model_lower for term in ["vision", "vl", "visual", "multimodal", "multi-modal"]):
+                capabilities["vision_capable"] = True
+                capabilities["image_generation"] = True
+        
+        # Update the model_capabilities with the new information
+        try:
+            if model_name not in self.model_capabilities:
+                self.model_capabilities[model_name] = {}
+                
+            self.model_capabilities[model_name].update({
+                k: v for k, v in capabilities.items() 
+                if k not in ["name"] and v is not None
+            })
+        except Exception as update_error:
+            print(f"Error updating model capabilities: {str(update_error)}")
+        
+        return {
+            "success": True,
+            "capabilities": capabilities
+        }
+        
+    def generate_image(self, prompt, size="512x512"):
+        """Generate an image based on the prompt"""
+        import requests
+        import json
+        import tempfile
+        import os
+        import base64
+        from datetime import datetime
+        
+        if not self.can_generate_images():
+            return None, "Current model does not support image generation"
+            
+        try:
+            if self.use_online_api:
+                # Use online API for image generation
+                if self.online_api.provider.lower() == "openai":
+                    # OpenAI DALL-E
+                    headers = {
+                        "Content-Type": "application/json",
+                        "Authorization": f"Bearer {self.online_api.api_key}"
+                    }
+                    data = {
+                        "model": "dall-e-3",
+                        "prompt": prompt,
+                        "size": size,
+                        "n": 1
+                    }
+                    response = requests.post(
+                        "https://api.openai.com/v1/images/generations",
+                        headers=headers,
+                        json=data
+                    )
+                    if response.status_code == 200:
+                        result = response.json()
+                        image_url = result["data"][0]["url"]
+                        # Download the image
+                        img_response = requests.get(image_url)
+                        if img_response.status_code == 200:
+                            # Save to temp file
+                            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                            img_path = os.path.join(tempfile.gettempdir(), f"generated_image_{timestamp}.png")
+                            with open(img_path, "wb") as f:
+                                f.write(img_response.content)
+                            return img_path, None
+                    return None, f"Error: {response.text}"
+                    
+                # Add support for other online providers here
+                return None, "Image generation not implemented for this provider"
+            else:
+                # Use local Ollama model for image generation
+                if not self.offline_mode:
+                    headers = {"Content-Type": "application/json"}
+                    data = {
+                        "model": self.model,
+                        "prompt": f"Generate an image of: {prompt}",
+                        "stream": False
+                    }
+                    
+                    response = requests.post(
+                        f"{self.base_url}/api/generate",
+                        headers=headers,
+                        json=data
+                    )
+                    
+                    if response.status_code == 200:
+                        result = response.json()
+                        response_text = result.get("response", "")
+                        
+                        # Check if response contains a base64 image
+                        if "data:image/" in response_text and ";base64," in response_text:
+                            # Extract base64 data
+                            img_data = response_text.split(";base64,")[1].strip()
+                            img_bytes = base64.b64decode(img_data)
+                            
+                            # Save to temp file
+                            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                            img_path = os.path.join(tempfile.gettempdir(), f"generated_image_{timestamp}.png")
+                            with open(img_path, "wb") as f:
+                                f.write(img_bytes)
+                            return img_path, None
+                        
+                        return None, "Model did not return an image"
+                    
+                    return None, f"Error: {response.text if hasattr(response, 'text') else 'Unknown error'}"
+                
+                return None, "Cannot generate images in offline mode"
+        except Exception as e:
+            return None, f"Error generating image: {str(e)}"
         # Default response
         return "I'm currently in offline mode. The Ollama AI service isn't available right now. You can still use all the todo list features, but AI assistance is limited."
 
@@ -648,84 +1171,196 @@ class OnlineAPIDialog(QDialog):
             QMessageBox.critical(self, "Error", f"Error: {str(e)}")
 
 class MessageBubble(QWidget):
-    """Custom widget for chat message bubbles"""
+    """Custom widget for message bubbles"""
     
-    def __init__(self, message, is_user=True, parent=None):
+    def __init__(self, content, is_user=True, parent=None):
         super().__init__(parent)
-        self.message = message
+        self.content = content
         self.is_user = is_user
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Minimum)
+        # Check if dark mode is enabled
+        self.dark_mode = self.is_dark_mode()
         self.init_ui()
+        
+    def is_dark_mode(self):
+        """Check if the application is in dark mode by looking at the palette"""
+        app = QApplication.instance()
+        if app:
+            palette = app.palette()
+            bg_color = palette.color(QPalette.Window)
+            # If background color is dark, we're in dark mode
+            return bg_color.lightness() < 128
+        return False
         
     def init_ui(self):
         """Initialize the UI"""
-        # Main layout with more space for content
-        layout = QHBoxLayout(self)
-        layout.setContentsMargins(5, 5, 5, 5)  # Reduce margins to allow more content space
+        # Main layout
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(4)
         
-        # Create bubble widget with optimized spacing
-        bubble = QFrame(self)
-        bubble_layout = QVBoxLayout(bubble)
+        # Header with avatar and name
+        header = QWidget()
+        header_layout = QHBoxLayout(header)
+        header_layout.setContentsMargins(12, 0, 12, 0)
+        header_layout.setSpacing(8)
         
-        # Different padding for user vs AI messages
+        # Create avatar label (circle with initials or icon)
+        avatar = QLabel()
+        avatar.setFixedSize(24, 24)
+        avatar.setAlignment(Qt.AlignCenter)
+        avatar.setStyleSheet("font-weight: bold; color: white; border-radius: 12px;")
+        
+        # Create name label
+        name_label = QLabel()
+        name_label.setStyleSheet("font-weight: bold; font-size: 13px;")
+        
         if self.is_user:
-            bubble_layout.setContentsMargins(12, 8, 12, 8)  # Standard padding for user
+            # User avatar - blue circle with "U"
+            avatar.setText("U")
+            avatar.setStyleSheet("background-color: #128C7E; color: white; border-radius: 12px; font-weight: bold;")
+            name_label.setText("You")
+            name_label.setStyleSheet("color: #128C7E; font-weight: bold; font-size: 13px;")
+            header_layout.setAlignment(Qt.AlignRight)
+            header_layout.addWidget(name_label)
+            header_layout.addWidget(avatar)
         else:
-            bubble_layout.setContentsMargins(16, 10, 16, 10)  # More padding for AI to improve readability
+            # AI avatar - purple circle with "AI"
+            avatar.setText("AI")
+            avatar.setStyleSheet("background-color: #9370DB; color: white; border-radius: 12px; font-weight: bold; font-size: 10px;")
+            name_label.setText("ChatMate Assistant")
+            name_label.setStyleSheet("color: #9370DB; font-weight: bold; font-size: 13px;")
+            header_layout.addWidget(avatar)
+            header_layout.addWidget(name_label)
+            header_layout.addStretch(1)
         
-        # Message text with responsive sizing
-        message_label = QLabel(self.message)
+        # Message container with rounded corners
+        container = QFrame()
+        container.setObjectName("messageContainer")
+        container.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Minimum)
+        
+        # Container layout
+        container_layout = QHBoxLayout(container)
+        container_layout.setContentsMargins(10, 6, 10, 6)  # Thinner margins
+        
+        # Avatar label
+        avatar_label = QLabel()
+        avatar_size = 32
+        avatar_label.setFixedSize(avatar_size, avatar_size)
+        avatar_label.setScaledContents(True)
+        
+        # Set avatar image based on sender
+        if self.is_user:
+            avatar_pixmap = QPixmap("user_avatar.png")
+            if not avatar_pixmap.isNull():
+                avatar_label.setPixmap(avatar_pixmap)
+            else:
+                # Fallback to text avatar
+                avatar_label.setText("")
+                avatar_label.setAlignment(Qt.AlignCenter)
+                if self.dark_mode:
+                    avatar_label.setStyleSheet("font-size: 20px; background-color: #2A2A2A; border-radius: 16px;")
+                else:
+                    avatar_label.setStyleSheet("font-size: 20px; background-color: #E0E0E0; border-radius: 16px;")
+        else:
+            avatar_pixmap = QPixmap("ai_avatar.png")
+            if not avatar_pixmap.isNull():
+                avatar_label.setPixmap(avatar_pixmap)
+            else:
+                # Fallback to text avatar
+                avatar_label.setText("")
+                avatar_label.setAlignment(Qt.AlignCenter)
+                if self.dark_mode:
+                    avatar_label.setStyleSheet("font-size: 20px; background-color: #2A2A2A; border-radius: 16px;")
+                else:
+                    avatar_label.setStyleSheet("font-size: 20px; background-color: #E0E0E0; border-radius: 16px;")
+        
+        # Message content
+        message_widget = QWidget()
+        message_layout = QVBoxLayout(message_widget)
+        message_layout.setContentsMargins(0, 0, 0, 0)
+        
+        # Sender name
+        sender_label = QLabel("You" if self.is_user else "ChatMate")
+        # Set sender color based on dark mode
+        if self.dark_mode:
+            sender_color = "#BBDEFB" if self.is_user else "#E0E0E0"
+        else:
+            sender_color = "#555555"
+        sender_label.setStyleSheet(f"font-weight: bold; font-size: 12px; color: {sender_color};")
+        message_layout.addWidget(sender_label)
+        
+        # Message text
+        message_label = QLabel(self.content)
         message_label.setWordWrap(True)
         message_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
-        message_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Minimum)
-        message_label.setMinimumWidth(200)  # Ensure minimum readable width
+        message_layout.addWidget(message_label)
         
-        # Set different maximum widths for user vs AI messages
+        # Add avatar and message to container
         if self.is_user:
-            message_label.setMaximumWidth(600)  # User messages can be narrower
+            container_layout.addWidget(message_widget)
+            container_layout.addWidget(avatar_label)
         else:
-            message_label.setMaximumWidth(800)  # AI messages can be wider
+            container_layout.addWidget(avatar_label)
+            container_layout.addWidget(message_widget)
         
-        # Add timestamp if needed
-        # timestamp_label = QLabel(datetime.now().strftime("%H:%M"))
-        # timestamp_label.setStyleSheet("color: rgba(255, 255, 255, 0.6); font-size: 10px;")
-        # timestamp_label.setAlignment(Qt.AlignRight)
-        
-        # Add widgets to bubble layout
-        bubble_layout.addWidget(message_label)
-        # bubble_layout.addWidget(timestamp_label)
-        
-        # Set alignment based on sender
+        # Style based on sender and dark mode
         if self.is_user:
-            layout.addStretch(1)
-            layout.addWidget(bubble)
-            bubble.setStyleSheet("""
-                QFrame {
-                    background-color: #128C7E; /* WhatsApp green */
-                    color: white;
-                    border-radius: 10px;
-                    border-bottom-right-radius: 2px;
-                }
-                QLabel {
-                    color: white;
-                    font-size: 14px;
-                }
-            """)
+            if self.dark_mode:
+                container.setStyleSheet(
+                    "#messageContainer { "
+                    "background-color: #1A3C5E; "
+                    "border-radius: 12px; "
+                    "margin-left: 60px; "
+                    "margin-right: 10px; "
+                    "border: 0.5px solid #2C5F8E; "
+                    "} "
+                    "QLabel { "
+                    "color: #FFFFFF; "
+                    "}"
+                )
+            else:
+                container.setStyleSheet(
+                    "#messageContainer { "
+                    "background-color: #E3F2FD; "
+                    "border-radius: 12px; "
+                    "margin-left: 60px; "
+                    "margin-right: 10px; "
+                    "border: 0.5px solid #BBDEFB; "
+                    "} "
+                    "QLabel { "
+                    "color: #0D47A1; "
+                    "}"
+                )
         else:
-            layout.addWidget(bubble)
-            layout.addStretch(1)
-            bubble.setStyleSheet("""
-                QFrame {
-                    background-color: #262D31; /* WhatsApp dark gray */
-                    color: white;
-                    border-radius: 10px;
-                    border-bottom-left-radius: 2px;
-                }
-                QLabel {
-                    color: white;
-                    font-size: 14px;
-                }
-            """)
+            if self.dark_mode:
+                container.setStyleSheet(
+                    "#messageContainer { "
+                    "background-color: #2A2A2A; "
+                    "border-radius: 12px; "
+                    "margin-left: 10px; "
+                    "margin-right: 60px; "
+                    "border: 0.5px solid #3A3A3A; "
+                    "} "
+                    "QLabel { "
+                    "color: #FFFFFF; "
+                    "}"
+                )
+            else:
+                container.setStyleSheet(
+                    "#messageContainer { "
+                    "background-color: #F5F5F5; "
+                    "border-radius: 12px; "
+                    "margin-left: 10px; "
+                    "margin-right: 60px; "
+                    "border: 0.5px solid #E0E0E0; "
+                    "} "
+                    "QLabel { "
+                    "color: #212121; "
+                    "}"
+                )
+        
+        layout.addWidget(container)
 
 class SystemMessageBubble(QWidget):
     """Custom widget for system message bubbles"""
@@ -735,65 +1370,116 @@ class SystemMessageBubble(QWidget):
         self.message = message
         self.is_error = is_error
         self.is_user = False  # System messages are never from the user
+        # Check if dark mode is enabled
+        self.dark_mode = self.is_dark_mode()
         self.init_ui()
+    
+    def is_dark_mode(self):
+        """Check if the application is in dark mode by looking at the palette"""
+        app = QApplication.instance()
+        if app:
+            palette = app.palette()
+            bg_color = palette.color(QPalette.Window)
+            # If background color is dark, we're in dark mode
+            return bg_color.lightness() < 128
+        return False
         
     def init_ui(self):
         """Initialize the UI"""
         # Main layout
-        layout = QHBoxLayout(self)
-        layout.setContentsMargins(10, 2, 10, 2)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
         
-        # Create bubble widget
-        bubble = QFrame(self)
-        bubble_layout = QVBoxLayout(bubble)
-        bubble_layout.setContentsMargins(12, 6, 12, 6)
+        # Message container with rounded corners
+        container = QFrame()
+        container.setObjectName("messageContainer")
+        container.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Minimum)
         
-        # Message text with responsive sizing
+        # Container layout
+        container_layout = QHBoxLayout(container)
+        container_layout.setContentsMargins(10, 6, 10, 6)  # Thinner margins
+        
+        # Add icon for system messages
+        icon_label = QLabel()
+        if self.is_error:
+            icon_label.setText("⚠️")
+        else:
+            icon_label.setText("ℹ️")
+        icon_label.setStyleSheet("font-size: 16px; margin-right: 8px;")
+        container_layout.addWidget(icon_label)
+        
+        # Message text
         message_label = QLabel(self.message)
         message_label.setWordWrap(True)
         message_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
-        message_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Minimum)
-        message_label.setMinimumWidth(200)  # Ensure minimum readable width
         
-        # Set different maximum widths for user vs AI messages
-        if self.is_user:
-            message_label.setMaximumWidth(600)  # User messages can be narrower
-        else:
-            message_label.setMaximumWidth(800)  # AI messages can be wider
+        # Add to container
+        container_layout.addWidget(message_label, 1)  # 1 = stretch factor
         
-        # Add widgets to bubble layout
-        bubble_layout.addWidget(message_label)
+        # Add container to main layout with center alignment
+        layout.setAlignment(Qt.AlignCenter)
         
-        # Center the bubble
-        layout.addStretch(1)
-        layout.addWidget(bubble)
-        layout.addStretch(1)
-        
-        # Style based on error status
+        # Style based on error status and dark mode
         if self.is_error:
-            bubble.setStyleSheet("""
-                QFrame {
-                    background-color: rgba(255, 107, 107, 0.7); /* Light red */
-                    color: white;
-                    border-radius: 10px;
-                }
-                QLabel {
-                    color: white;
-                    font-size: 12px;
-                }
-            """)
+            if self.dark_mode:
+                container.setStyleSheet(
+                    "#messageContainer { "
+                    "background-color: #4A1515; "
+                    "border-radius: 12px; "
+                    "margin-left: 60px; "
+                    "margin-right: 60px; "
+                    "border: 0.5px solid #5D2929; "
+                    "} "
+                    "QLabel { "
+                    "color: #FFCDD2; "
+                    "font-size: 13px; "
+                    "}"
+                )
+            else:
+                container.setStyleSheet(
+                    "#messageContainer { "
+                    "background-color: #FFEBEE; "
+                    "border-radius: 12px; "
+                    "margin-left: 60px; "
+                    "margin-right: 60px; "
+                    "border: 0.5px solid #FFCDD2; "
+                    "} "
+                    "QLabel { "
+                    "color: #D32F2F; "
+                    "font-size: 13px; "
+                    "}"
+                )
         else:
-            bubble.setStyleSheet("""
-                QFrame {
-                    background-color: rgba(78, 201, 176, 0.7); /* Light teal */
-                    color: white;
-                    border-radius: 10px;
-                }
-                QLabel {
-                    color: white;
-                    font-size: 12px;
-                }
-            """)
+            if self.dark_mode:
+                container.setStyleSheet(
+                    "#messageContainer { "
+                    "background-color: #1E3B1E; "
+                    "border-radius: 12px; "
+                    "margin-left: 60px; "
+                    "margin-right: 60px; "
+                    "border: 0.5px solid #2C4F2C; "
+                    "} "
+                    "QLabel { "
+                    "color: #C8E6C9; "
+                    "font-size: 13px; "
+                    "}"
+                )
+            else:
+                container.setStyleSheet(
+                    "#messageContainer { "
+                    "background-color: #E8F5E9; "
+                    "border-radius: 12px; "
+                    "margin-left: 60px; "
+                    "margin-right: 60px; "
+                    "border: 0.5px solid #C8E6C9; "
+                    "} "
+                    "QLabel { "
+                    "color: #2E7D32; "
+                    "font-size: 13px; "
+                    "}"
+                )
+        
+        layout.addWidget(container)
 
 class ImageMessageBubble(QWidget):
     """Custom widget for image message bubbles"""
@@ -804,139 +1490,534 @@ class ImageMessageBubble(QWidget):
         self.caption = caption
         self.is_user = is_user
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Minimum)
+        # Check if dark mode is enabled
+        self.dark_mode = self.is_dark_mode()
         self.init_ui()
+        
+    def is_dark_mode(self):
+        """Check if the application is in dark mode by looking at the palette"""
+        app = QApplication.instance()
+        if app:
+            palette = app.palette()
+            bg_color = palette.color(QPalette.Window)
+            # If background color is dark, we're in dark mode
+            return bg_color.lightness() < 128
+        return False
         
     def init_ui(self):
         """Initialize the UI"""
         # Main layout with more space for content
-        layout = QHBoxLayout(self)
-        layout.setContentsMargins(5, 5, 5, 5)  # Reduce margins to allow more content space
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(4)
         
-        # Create bubble widget with optimized spacing
-        bubble = QFrame(self)
-        bubble_layout = QVBoxLayout(bubble)
-        bubble_layout.setContentsMargins(12, 10, 12, 10)  # More padding for better readability
+        # Header with avatar and name
+        header = QWidget()
+        header_layout = QHBoxLayout(header)
+        header_layout.setContentsMargins(12, 0, 12, 0)
+        header_layout.setSpacing(8)
         
-        # Image label with responsive sizing
-        from PyQt5.QtGui import QPixmap
+        # Create avatar label (circle with initials or icon)
+        avatar = QLabel()
+        avatar.setFixedSize(24, 24)
+        avatar.setAlignment(Qt.AlignCenter)
+        avatar.setStyleSheet("font-weight: bold; color: white; border-radius: 12px;")
+        
+        # Create name label
+        name_label = QLabel()
+        
+        # Set styles based on dark mode
+        if self.dark_mode:
+            user_color = "#7AB0FF"
+            ai_color = "#E0E0E0"
+        else:
+            user_color = "#128C7E"
+            ai_color = "#9370DB"
+        
+        if self.is_user:
+            # User avatar - blue circle with "U"
+            avatar.setText("U")
+            avatar.setStyleSheet(f"background-color: {user_color}; color: white; border-radius: 12px; font-weight: bold;")
+            name_label.setText("You")
+            name_label.setStyleSheet(f"color: {user_color}; font-weight: bold; font-size: 13px;")
+            header_layout.setAlignment(Qt.AlignRight)
+            header_layout.addWidget(name_label)
+            header_layout.addWidget(avatar)
+        else:
+            # AI avatar - purple circle with "AI"
+            avatar.setText("AI")
+            avatar.setStyleSheet(f"background-color: {ai_color}; color: white; border-radius: 12px; font-weight: bold; font-size: 10px;")
+            name_label.setText("ChatMate Assistant")
+            name_label.setStyleSheet(f"color: {ai_color}; font-weight: bold; font-size: 13px;")
+            header_layout.addWidget(avatar)
+            header_layout.addWidget(name_label)
+            header_layout.addStretch(1)
+        
+        # Image container with rounded corners
+        container = QFrame()
+        container.setObjectName("imageContainer")
+        container.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Minimum)
+        
+        # Container layout
+        container_layout = QVBoxLayout(container)
+        container_layout.setContentsMargins(10, 6, 10, 6)  # Thinner margins
+        
+        # Image label
         image_label = QLabel()
         image_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Minimum)
         
-        # Load and scale image based on window size
+        # Load and scale image
+        from PyQt5.QtGui import QPixmap
         pixmap = QPixmap(self.image_path)
-        # Get available width - wider for better viewing
-        max_width = 800 if not self.is_user else 600  # AI images can be wider
-        available_width = min(self.width() if self.width() > 0 else 400, max_width)
-        # Scale image to a reasonable size while maintaining aspect ratio
+        available_width = min(self.width() if self.width() > 0 else 400, 600)
         scaled_pixmap = pixmap.scaled(available_width, 400, Qt.KeepAspectRatio, Qt.SmoothTransformation)
         image_label.setPixmap(scaled_pixmap)
         
-        # Handle window resize events
-        self.resizeEvent = self.on_resize
-        self.original_pixmap = pixmap  # Store original for rescaling
-        
-        # Caption text if provided
+        # Add caption if provided
         if self.caption:
             caption_label = QLabel(self.caption)
             caption_label.setWordWrap(True)
             caption_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
             caption_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Minimum)
-            caption_label.setMinimumWidth(200)
-            caption_label.setMaximumWidth(800)  # Wider captions for better readability
-            bubble_layout.addWidget(caption_label)
-        
-        # Add widgets to bubble layout
-        bubble_layout.addWidget(image_label)
+            # Add caption to container
+            container_layout.addWidget(image_label)
+            container_layout.addWidget(caption_label)
+        else:
+            # Just add the image
+            container_layout.addWidget(image_label)
         
         # Store the image label for resizing
         self.image_label = image_label
+        self.pixmap = pixmap
         
-        # Set alignment based on sender
+        # Add header and container to main layout with appropriate alignment
         if self.is_user:
-            layout.addStretch(1)
-            layout.addWidget(bubble)
-            bubble.setStyleSheet("""
-                QFrame {
-                    background-color: #128C7E; /* WhatsApp green */
-                    color: white;
-                    border-radius: 10px;
-                    border-bottom-right-radius: 2px;
-                }
-                QLabel {
-                    color: white;
-                    font-size: 14px;
-                }
-            """)
+            layout.addWidget(header, 0, Qt.AlignRight)
+            if self.dark_mode:
+                container.setStyleSheet(
+                    "#imageContainer { "
+                    "background-color: #1A3C5E; "
+                    "border-radius: 12px; "
+                    "border-top-right-radius: 4px; "
+                    "margin-left: 48px; "
+                    "margin-right: 12px; "
+                    "border: 0.5px solid #2C5F8E; "
+                    "} "
+                    "QLabel { "
+                    "color: #FFFFFF; "
+                    "font-size: 14px; "
+                    "}"
+                )
+            else:
+                container.setStyleSheet(
+                    "#imageContainer { "
+                    "background-color: #E7F7FF; "
+                    "color: #1A1A1A; "
+                    "border-radius: 12px; "
+                    "border-top-right-radius: 4px; "
+                    "margin-left: 48px; "
+                    "margin-right: 12px; "
+                    "border: 0.5px solid #D1E7FA; "
+                    "} "
+                    "QLabel { "
+                    "color: #1A1A1A; "
+                    "font-size: 14px; "
+                    "}"
+                )
         else:
-            layout.addWidget(bubble)
-            layout.addStretch(1)
-            bubble.setStyleSheet("""
-                QFrame {
-                    background-color: #262D31; /* WhatsApp dark gray */
-                    color: white;
-                    border-radius: 10px;
-                    border-bottom-left-radius: 2px;
-                }
-                QLabel {
-                    color: white;
-                    font-size: 14px;
-                }
-            """)
+            layout.addWidget(header, 0, Qt.AlignLeft)
+            if self.dark_mode:
+                container.setStyleSheet(
+                    "#imageContainer { "
+                    "background-color: #2A2A2A; "
+                    "border-radius: 12px; "
+                    "border-top-left-radius: 4px; "
+                    "margin-right: 48px; "
+                    "margin-left: 12px; "
+                    "border: 0.5px solid #3A3A3A; "
+                    "} "
+                    "QLabel { "
+                    "color: #FFFFFF; "
+                    "font-size: 14px; "
+                    "}"
+                )
+            else:
+                container.setStyleSheet(
+                    "#imageContainer { "
+                    "background-color: #F9F9FA; "
+                    "color: #1A1A1A; "
+                    "border-radius: 12px; "
+                    "border-top-left-radius: 4px; "
+                    "margin-right: 48px; "
+                    "margin-left: 12px; "
+                    "border: 0.5px solid #E4E4E7; "
+                    "} "
+                    "QLabel { "
+                    "color: #1A1A1A; "
+                    "font-size: 14px; "
+                    "}"
+                )
+        
+        layout.addWidget(container)
             
-    def on_resize(self, event):
+    def resizeEvent(self, event):
         """Handle resize events to scale images appropriately"""
-        if hasattr(self, 'original_pixmap') and hasattr(self, 'image_label'):
-            # Get available width (capped at 600px for large screens)
-            available_width = min(self.width() if self.width() > 0 else 300, 600)
-            # Rescale image based on new size
-            scaled_pixmap = self.original_pixmap.scaled(
-                available_width, 300, Qt.KeepAspectRatio, Qt.SmoothTransformation
-            )
+        if hasattr(self, 'image_label') and hasattr(self, 'pixmap'):
+            # Get available width (accounting for margins and padding)
+            available_width = min(self.width() - 80 if self.width() > 80 else 300, 600)
+            
+            # Scale image to fit available width while maintaining aspect ratio
+            scaled_pixmap = self.pixmap.scaled(available_width, 400, Qt.KeepAspectRatio, Qt.SmoothTransformation)
             self.image_label.setPixmap(scaled_pixmap)
         
         # Call the parent class's resize event handler
         super().resizeEvent(event)
 
+class DatabaseManager:
+    """Class to manage SQLite database operations"""
+    
+    def __init__(self, db_file=DB_FILE):
+        self.db_file = db_file
+        self.conn = None
+        self.init_db()
+    
+    def init_db(self):
+        """Initialize the database and create tables if they don't exist"""
+        try:
+            self.conn = sqlite3.connect(self.db_file)
+            cursor = self.conn.cursor()
+            
+            # Create todos table
+            cursor.execute('''
+            CREATE TABLE IF NOT EXISTS todos (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                task TEXT NOT NULL,
+                status TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )
+            ''')
+            
+            # Create conversations table
+            cursor.execute('''
+            CREATE TABLE IF NOT EXISTS conversations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                title TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                ai_mood TEXT DEFAULT 'professional'
+            )
+            ''')
+            
+            # Create messages table
+            cursor.execute('''
+            CREATE TABLE IF NOT EXISTS messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                conversation_id INTEGER NOT NULL,
+                role TEXT NOT NULL,
+                content TEXT NOT NULL,
+                timestamp TEXT NOT NULL,
+                image_path TEXT,
+                FOREIGN KEY (conversation_id) REFERENCES conversations (id)
+            )
+            ''')
+            
+            # Create settings table
+            cursor.execute('''
+            CREATE TABLE IF NOT EXISTS settings (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                key TEXT UNIQUE NOT NULL,
+                value TEXT NOT NULL
+            )
+            ''')
+            
+            self.conn.commit()
+            return True
+        except sqlite3.Error as e:
+            print(f"Database error: {e}")
+            return False
+    
+    def close(self):
+        """Close the database connection"""
+        if self.conn:
+            self.conn.close()
+    
+    def get_todos(self):
+        """Get all todos from database"""
+        try:
+            cursor = self.conn.cursor()
+            cursor.execute("SELECT id, task, status, created_at FROM todos")
+            rows = cursor.fetchall()
+            
+            todos = []
+            for row in rows:
+                todos.append({
+                    "id": row[0],
+                    "task": row[1],
+                    "status": row[2],
+                    "created_at": row[3]
+                })
+            
+            return todos
+        except sqlite3.Error as e:
+            print(f"Error getting todos: {e}")
+            return []
+    
+    def add_todo(self, task, status="To Do"):
+        """Add a new todo to the database"""
+        try:
+            cursor = self.conn.cursor()
+            created_at = datetime.now().isoformat()
+            
+            cursor.execute(
+                "INSERT INTO todos (task, status, created_at) VALUES (?, ?, ?)",
+                (task, status, created_at)
+            )
+            
+            self.conn.commit()
+            todo_id = cursor.lastrowid
+            
+            return {
+                "id": todo_id,
+                "task": task,
+                "status": status,
+                "created_at": created_at
+            }
+        except sqlite3.Error as e:
+            print(f"Error adding todo: {e}")
+            return None
+    
+    def update_todo(self, todo_id, status):
+        """Update a todo's status"""
+        try:
+            cursor = self.conn.cursor()
+            cursor.execute(
+                "UPDATE todos SET status = ? WHERE id = ?",
+                (status, todo_id)
+            )
+            self.conn.commit()
+            return cursor.rowcount > 0
+        except sqlite3.Error as e:
+            print(f"Error updating todo: {e}")
+            return False
+    
+    def delete_todo(self, todo_id):
+        """Delete a todo"""
+        try:
+            cursor = self.conn.cursor()
+            cursor.execute("DELETE FROM todos WHERE id = ?", (todo_id,))
+            self.conn.commit()
+            return cursor.rowcount > 0
+        except sqlite3.Error as e:
+            print(f"Error deleting todo: {e}")
+            return False
+    
+    def get_conversations(self):
+        """Get all conversations"""
+        try:
+            cursor = self.conn.cursor()
+            cursor.execute("SELECT id, title, created_at, updated_at, ai_mood FROM conversations ORDER BY updated_at DESC")
+            rows = cursor.fetchall()
+            
+            conversations = []
+            for row in rows:
+                conversations.append({
+                    "id": row[0],
+                    "title": row[1],
+                    "created_at": row[2],
+                    "updated_at": row[3],
+                    "ai_mood": row[4]
+                })
+            
+            return conversations
+        except sqlite3.Error as e:
+            print(f"Error getting conversations: {e}")
+            return []
+    
+    def create_conversation(self, title, ai_mood="professional"):
+        """Create a new conversation"""
+        try:
+            cursor = self.conn.cursor()
+            now = datetime.now().isoformat()
+            
+            cursor.execute(
+                "INSERT INTO conversations (title, created_at, updated_at, ai_mood) VALUES (?, ?, ?, ?)",
+                (title, now, now, ai_mood)
+            )
+            
+            self.conn.commit()
+            return cursor.lastrowid
+        except sqlite3.Error as e:
+            print(f"Error creating conversation: {e}")
+            return None
+    
+    def update_conversation(self, conversation_id, title=None, ai_mood=None):
+        """Update a conversation"""
+        try:
+            cursor = self.conn.cursor()
+            now = datetime.now().isoformat()
+            updates = []
+            params = []
+            
+            if title is not None:
+                updates.append("title = ?")
+                params.append(title)
+            
+            if ai_mood is not None:
+                updates.append("ai_mood = ?")
+                params.append(ai_mood)
+            
+            if updates:
+                updates.append("updated_at = ?")
+                params.append(now)
+                params.append(conversation_id)
+                
+                query = f"UPDATE conversations SET {', '.join(updates)} WHERE id = ?"
+                cursor.execute(query, params)
+                self.conn.commit()
+                
+                return cursor.rowcount > 0
+            return False
+        except sqlite3.Error as e:
+            print(f"Error updating conversation: {e}")
+            return False
+    
+    def delete_conversation(self, conversation_id):
+        """Delete a conversation and its messages"""
+        try:
+            cursor = self.conn.cursor()
+            
+            # Delete messages first (foreign key constraint)
+            cursor.execute("DELETE FROM messages WHERE conversation_id = ?", (conversation_id,))
+            
+            # Delete the conversation
+            cursor.execute("DELETE FROM conversations WHERE id = ?", (conversation_id,))
+            
+            self.conn.commit()
+            return cursor.rowcount > 0
+        except sqlite3.Error as e:
+            print(f"Error deleting conversation: {e}")
+            return False
+    
+    def get_messages(self, conversation_id):
+        """Get all messages for a conversation"""
+        try:
+            cursor = self.conn.cursor()
+            cursor.execute(
+                "SELECT id, role, content, timestamp, image_path FROM messages WHERE conversation_id = ? ORDER BY timestamp",
+                (conversation_id,)
+            )
+            rows = cursor.fetchall()
+            
+            messages = []
+            for row in rows:
+                messages.append({
+                    "id": row[0],
+                    "role": row[1],
+                    "content": row[2],
+                    "timestamp": row[3],
+                    "image_path": row[4]
+                })
+            
+            return messages
+        except sqlite3.Error as e:
+            print(f"Error getting messages: {e}")
+            return []
+    
+    def add_message(self, conversation_id, role, content, image_path=None):
+        """Add a message to a conversation"""
+        try:
+            cursor = self.conn.cursor()
+            timestamp = datetime.now().isoformat()
+            
+            cursor.execute(
+                "INSERT INTO messages (conversation_id, role, content, timestamp, image_path) VALUES (?, ?, ?, ?, ?)",
+                (conversation_id, role, content, timestamp, image_path)
+            )
+            
+            # Update conversation's updated_at timestamp
+            cursor.execute(
+                "UPDATE conversations SET updated_at = ? WHERE id = ?",
+                (timestamp, conversation_id)
+            )
+            
+            self.conn.commit()
+            
+            return {
+                "id": cursor.lastrowid,
+                "role": role,
+                "content": content,
+                "timestamp": timestamp,
+                "image_path": image_path
+            }
+        except sqlite3.Error as e:
+            print(f"Error adding message: {e}")
+            return None
+    
+    def get_setting(self, key, default=None):
+        """Get a setting value"""
+        try:
+            cursor = self.conn.cursor()
+            cursor.execute("SELECT value FROM settings WHERE key = ?", (key,))
+            row = cursor.fetchone()
+            
+            if row:
+                return row[0]
+            return default
+        except sqlite3.Error as e:
+            print(f"Error getting setting: {e}")
+            return default
+    
+    def set_setting(self, key, value):
+        """Set a setting value"""
+        try:
+            cursor = self.conn.cursor()
+            cursor.execute(
+                "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
+                (key, value)
+            )
+            self.conn.commit()
+            return True
+        except sqlite3.Error as e:
+            print(f"Error setting setting: {e}")
+            return False
+
+
 class ChatHistory:
-    """Class to store and manage chat history"""
+    """Class to store and manage chat history (legacy JSON-based version)"""
     
     def __init__(self, max_history=10):
         self.max_history = max_history
         self.history = []
         self.history_file = "chat_history.json"
-        self.load_history()
     
     def add_message(self, role, content, image_path=None):
         """Add a message to the history"""
         message = {
-            "role": role,  # 'user', 'ai', or 'system'
+            "role": role,
             "content": content,
             "timestamp": datetime.now().isoformat(),
-            "image_path": image_path  # Path to image if this is an image message
+            "image_path": image_path
         }
         
         self.history.append(message)
         
-        # Trim history if it exceeds max size
-        if len(self.history) > self.max_history:
-            self.history = self.history[-self.max_history:]
+        # Limit history size
+        if len(self.history) > self.max_history * 100:  # Allow ~100 messages per conversation
+            self.history = self.history[-self.max_history * 100:]
             
-        # Save history
+        # Save to file
         self.save_history()
         
         return message
     
     def get_history(self):
-        """Get the full chat history"""
         return self.history
     
     def clear_history(self):
-        """Clear the chat history"""
         self.history = []
         self.save_history()
     
     def save_history(self):
-        """Save chat history to file"""
         try:
             with open(self.history_file, "w") as f:
                 json.dump(self.history, f, indent=2)
@@ -944,29 +2025,30 @@ class ChatHistory:
             print(f"Error saving chat history: {e}")
     
     def load_history(self):
-        """Load chat history from file"""
         if os.path.exists(self.history_file):
             try:
                 with open(self.history_file, "r") as f:
                     self.history = json.load(f)
-                    
-                    # Ensure we don't exceed max history
-                    if len(self.history) > self.max_history:
-                        self.history = self.history[-self.max_history:]
             except Exception as e:
                 print(f"Error loading chat history: {e}")
+                self.history = []
+
 
 class ChatMateApp(QMainWindow):
     """Main application window"""
     
     def __init__(self):
         super().__init__()
+        self.db = DatabaseManager()
         self.todos = []
         self.chatbot = ChatbotAPI()
-        self.chat_history_manager = ChatHistory(max_history=10)
+        self.chat_history_manager = ChatHistory(max_history=10)  # Legacy system
         self.current_theme = "dark"  # Default theme
+        self.current_conversation_id = None
+        self.conversations = []
         self.init_ui()
         self.load_todos()
+        self.load_conversations()
         self.apply_theme(self.current_theme)
         
     def init_ui(self):
@@ -1083,6 +2165,25 @@ class ChatMateApp(QMainWindow):
             self.online_api_label.setText("☁️ Off")
             self.online_api_label.setStyleSheet("color: #6c6c6c;")
         
+        # AI Mood selector
+        mood_label = QLabel("AI Mood:")
+        mood_label.setStyleSheet("color: #d7ba7d; font-weight: bold;")
+        
+        self.mood_selector = QComboBox()
+        for mood_key, mood_data in AI_MOODS.items():
+            self.mood_selector.addItem(mood_data["name"], mood_key)
+        
+        # Set current mood
+        current_mood_index = self.mood_selector.findData(self.chatbot.current_mood)
+        if current_mood_index >= 0:
+            self.mood_selector.setCurrentIndex(current_mood_index)
+        
+        self.mood_selector.currentIndexChanged.connect(self.change_ai_mood)
+        
+        # Mood indicator
+        self.mood_indicator = QLabel()
+        self.update_mood_indicator()
+        
         clear_history_btn = QPushButton("Clear History")
         clear_history_btn.clicked.connect(self.clear_chat_history)
         
@@ -1092,6 +2193,9 @@ class ChatMateApp(QMainWindow):
         model_layout.addWidget(refresh_btn)
         model_layout.addWidget(online_api_btn)
         model_layout.addWidget(self.online_api_label)
+        model_layout.addWidget(mood_label)
+        model_layout.addWidget(self.mood_selector)
+        model_layout.addWidget(self.mood_indicator)
         model_layout.addWidget(clear_history_btn)
         
         # Chat history display - using a scroll area with widgets instead of QTextEdit
@@ -1260,10 +2364,31 @@ class ChatMateApp(QMainWindow):
         """)
         audio_btn.clicked.connect(self.record_audio)
         
+        # Image generation button (only visible for capable models)
+        self.generate_image_btn = QPushButton()
+        self.generate_image_btn.setIcon(QIcon.fromTheme("insert-image"))
+        self.generate_image_btn.setMinimumSize(36, 36)
+        self.generate_image_btn.setMaximumSize(40, 40)
+        self.generate_image_btn.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+        self.generate_image_btn.setToolTip("Generate an image with AI")
+        self.generate_image_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #9370DB; /* Purple for image generation */
+                border-radius: 20px;
+                padding: 5px;
+            }
+            QPushButton:hover {
+                background-color: #8A2BE2;
+            }
+        """)
+        self.generate_image_btn.clicked.connect(self.show_image_generation_dialog)
+        self.generate_image_btn.setVisible(self.chatbot.can_generate_images())
+        
         # Add buttons to layout
         chat_input_layout.addWidget(upload_btn)
         chat_input_layout.addWidget(cloud_btn)
         chat_input_layout.addWidget(audio_btn)
+        chat_input_layout.addWidget(self.generate_image_btn)  # Add image generation button
         chat_input_layout.addWidget(self.chat_input)
         chat_input_layout.addWidget(self.send_btn)
         
@@ -1277,7 +2402,93 @@ class ChatMateApp(QMainWindow):
         """)
         chat_title.setAlignment(Qt.AlignCenter)
         
-        chat_layout.addWidget(chat_title)
+        chat_header = QWidget()
+        chat_header_layout = QHBoxLayout(chat_header)
+        chat_header_layout.setContentsMargins(10, 5, 10, 5)
+        
+        chat_title = QLabel("ChatMate Assistant")
+        chat_title.setStyleSheet("""
+            font-size: 18px; 
+            font-weight: bold; 
+            color: #E9EDF0;
+            padding: 5px;
+        """)
+        
+        # Conversation selector
+        self.conversation_selector = QComboBox()
+        self.conversation_selector.setMinimumWidth(200)
+        self.conversation_selector.setStyleSheet("""
+            background-color: #2A3942;
+            color: #D1D7DB;
+            border-radius: 4px;
+            padding: 5px;
+            font-size: 14px;
+        """)
+        self.conversation_selector.currentIndexChanged.connect(self.change_conversation)
+        
+        # New conversation button
+        new_chat_btn = QPushButton("+")
+        new_chat_btn.setToolTip("New Conversation")
+        new_chat_btn.setFixedSize(30, 30)
+        new_chat_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #00A884;
+                color: white;
+                border-radius: 15px;
+                font-weight: bold;
+                font-size: 16px;
+            }
+            QPushButton:hover {
+                background-color: #128C7E;
+            }
+        """)
+        new_chat_btn.clicked.connect(self.new_conversation)
+        
+        # Delete conversation button
+        delete_chat_btn = QPushButton("×")
+        delete_chat_btn.setToolTip("Delete Current Conversation")
+        delete_chat_btn.setFixedSize(30, 30)
+        delete_chat_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #FF5252;
+                color: white;
+                border-radius: 15px;
+                font-weight: bold;
+                font-size: 16px;
+            }
+            QPushButton:hover {
+                background-color: #FF0000;
+            }
+        """)
+        delete_chat_btn.clicked.connect(self.delete_current_conversation)
+        
+        # Settings button
+        settings_btn = QPushButton()
+        settings_btn.setIcon(QIcon.fromTheme("preferences-system"))
+        settings_btn.setToolTip("Model Settings & Local Model Scan")
+        settings_btn.setFixedSize(30, 30)
+        settings_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #607D8B;
+                color: white;
+                border-radius: 15px;
+                font-weight: bold;
+                font-size: 16px;
+            }
+            QPushButton:hover {
+                background-color: #455A64;
+            }
+        """)
+        settings_btn.clicked.connect(self.show_model_settings_dialog)
+        
+        chat_header_layout.addWidget(chat_title)
+        chat_header_layout.addStretch(1)
+        chat_header_layout.addWidget(self.conversation_selector)
+        chat_header_layout.addWidget(new_chat_btn)
+        chat_header_layout.addWidget(delete_chat_btn)
+        chat_header_layout.addWidget(settings_btn)
+        
+        chat_layout.addWidget(chat_header)
         chat_layout.addLayout(theme_layout)  # Add theme selector
         chat_layout.addWidget(chat_scroll)
         chat_layout.addWidget(chat_input_container)
@@ -1536,16 +2747,24 @@ class ChatMateApp(QMainWindow):
         if model_name and model_name != "No models available":
             success = self.chatbot.set_model(model_name)
             if success:
-                self.chat_history.append(f"<span style='color:#4ec9b0;'><b>System:</b> Switched to model: {model_name}</span>")
-                self.chat_history.append("")
-            else:
-                self.chat_history.append(f"<span style='color:#ff6b6b;'><b>System:</b> Failed to switch to model: {model_name}</span>")
-                self.chat_history.append("")
+                # Update UI based on model capabilities
+                self.update_ui_for_model_capabilities()
                 
-            # Scroll to bottom
-            self.chat_history.verticalScrollBar().setValue(
-                self.chat_history.verticalScrollBar().maximum()
-            )
+                # Add system message about model change
+                self.add_system_message(f"Switched to model: {model_name}")
+                
+                # Check if model supports image generation
+                if self.chatbot.can_generate_images():
+                    self.add_system_message(f"This model supports image generation!")
+            else:
+                self.add_system_message(f"Failed to switch to model: {model_name}", is_error=True)
+    
+    def update_ui_for_model_capabilities(self):
+        """Update UI elements based on current model capabilities"""
+        # Update image generation button visibility
+        if hasattr(self, 'generate_image_btn'):
+            self.generate_image_btn.setVisible(self.chatbot.can_generate_images())
+            self.generate_image_btn.setEnabled(self.chatbot.can_generate_images())
     
     def configure_online_api(self):
         """Configure online API settings"""
@@ -1562,6 +2781,31 @@ class ChatMateApp(QMainWindow):
         # This is an alias for configure_online_api for better readability
         self.configure_online_api()
         
+    def update_mood_indicator(self):
+        """Update the mood indicator label"""
+        if hasattr(self, 'mood_indicator') and hasattr(self.chatbot, 'current_mood'):
+            mood = self.chatbot.current_mood
+            if mood in AI_MOODS:
+                color = AI_MOODS[mood]["color"]
+                self.mood_indicator.setText("●")
+                self.mood_indicator.setStyleSheet(f"color: {color}; font-size: 16px;")
+                self.mood_indicator.setToolTip(AI_MOODS[mood]["description"])
+    
+    def change_ai_mood(self, index):
+        """Change the AI assistant's mood"""
+        mood_key = self.mood_selector.itemData(index)
+        if mood_key and mood_key in AI_MOODS:
+            self.chatbot.current_mood = mood_key
+            self.update_mood_indicator()
+            
+            # Update current conversation mood if one exists
+            if self.current_conversation_id:
+                self.db.update_conversation(self.current_conversation_id, ai_mood=mood_key)
+            
+            # Add system message about mood change
+            mood_name = AI_MOODS[mood_key]["name"]
+            self.add_system_message(f"AI mood changed to: {mood_name}")
+    
     def change_theme(self, theme_name):
         """Change the application theme"""
         theme_name = theme_name.lower()
@@ -1671,7 +2915,7 @@ class ChatMateApp(QMainWindow):
             self.add_system_message("Recording audio... (speak now)")
             
             # Simulate audio recording (in a real app, we would use PyAudio or similar)
-            # For this demo, we'll just wait a moment and then add a message
+            # For now, just wait a moment and then add a message
             QApplication.processEvents()
             
             # In a real implementation, we would record audio and transcribe it
@@ -1721,97 +2965,1059 @@ class ChatMateApp(QMainWindow):
     
     def upload_image(self):
         """Upload an image for analysis"""
-        from PyQt5.QtWidgets import QFileDialog
-        
-        # Open file dialog to select an image
         file_dialog = QFileDialog()
+        file_dialog.setFileMode(QFileDialog.ExistingFile)
         file_dialog.setNameFilter("Images (*.png *.jpg *.jpeg *.bmp *.gif)")
-        file_dialog.setViewMode(QFileDialog.Detail)
         
         if file_dialog.exec_():
-            image_path = file_dialog.selectedFiles()[0]
-            if image_path:
-                # Add image message to chat
+            file_paths = file_dialog.selectedFiles()
+            if file_paths:
+                image_path = file_paths[0]
                 self.add_image_message(image_path)
-                
-                # Analyze the image
                 self.analyze_image(image_path)
+                
+    def show_image_generation_dialog(self):
+        """Show dialog to generate an image with AI"""
+        # Create a custom dialog
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Generate Image with AI")
+        dialog.setMinimumWidth(400)
+        
+        # Layout
+        layout = QVBoxLayout(dialog)
+        
+        # Prompt input
+        prompt_label = QLabel("Describe the image you want to generate:")
+        prompt_input = QTextEdit()
+        prompt_input.setPlaceholderText("E.g., A serene mountain landscape with a lake at sunset, photorealistic style")
+        prompt_input.setMinimumHeight(100)
+        
+        # Size selection
+        size_label = QLabel("Image size:")
+        size_combo = QComboBox()
+        size_combo.addItems(["256x256", "512x512", "1024x1024"])
+        size_combo.setCurrentText("512x512")
+        
+        # Model info
+        model_label = QLabel(f"Using model: {self.chatbot.model}")
+        model_label.setStyleSheet("color: #888888; font-style: italic;")
+        
+        # Buttons
+        button_box = QHBoxLayout()
+        cancel_btn = QPushButton("Cancel")
+        generate_btn = QPushButton("Generate")
+        generate_btn.setObjectName("generate_btn")  # Set object name for later reference
+        generate_btn.setStyleSheet("background-color: #9370DB; color: white; font-weight: bold;")
+        
+        button_box.addWidget(cancel_btn)
+        button_box.addWidget(generate_btn)
+        
+        # Add widgets to layout
+        layout.addWidget(prompt_label)
+        layout.addWidget(prompt_input)
+        layout.addWidget(size_label)
+        layout.addWidget(size_combo)
+        layout.addWidget(model_label)
+        layout.addLayout(button_box)
+        
+        # Progress indicator
+        progress_label = QLabel("Generating image...")
+        progress_label.setObjectName("progress_label")  # Set object name for later reference
+        progress_label.setVisible(False)
+        progress_bar = QProgressBar()
+        progress_bar.setRange(0, 0)  # Indeterminate progress
+        progress_bar.setVisible(False)
+        
+        layout.addWidget(progress_label)
+        layout.addWidget(progress_bar)
+        
+        # Connect signals
+        cancel_btn.clicked.connect(dialog.reject)
+        
+        # Generation function
+        def start_generation():
+            prompt = prompt_input.toPlainText().strip()
+            if not prompt:
+                QMessageBox.warning(dialog, "Empty Prompt", "Please enter a description for the image.")
+                return
+                
+            # Show progress
+            generate_btn.setEnabled(False)
+            prompt_input.setEnabled(False)
+            size_combo.setEnabled(False)
+            progress_label.setVisible(True)
+            progress_bar.setVisible(True)
+            
+            # Use a timer to allow UI to update
+            QTimer.singleShot(100, lambda: self.generate_ai_image(prompt, size_combo.currentText(), dialog))
+            
+        generate_btn.clicked.connect(start_generation)
+        
+        # Show dialog
+        dialog.exec_()
+        
+    def show_model_settings_dialog(self):
+        """Show dialog for model settings and local model scanning"""
+        # Create a custom dialog
+        dialog = QDialog(self)
+        dialog.setWindowTitle("AI Model Settings")
+        dialog.setMinimumWidth(500)
+        dialog.setMinimumHeight(400)
+        
+        # Main layout
+        layout = QVBoxLayout(dialog)
+        
+        # Create tabs
+        tabs = QTabWidget()
+        model_tab = QWidget()
+        scan_tab = QWidget()
+        
+        # Model selection tab
+        model_layout = QVBoxLayout(model_tab)
+        
+        # Current model info
+        current_model_frame = QFrame()
+        current_model_frame.setFrameShape(QFrame.StyledPanel)
+        current_model_frame.setStyleSheet("background-color: #2A3942; border-radius: 8px; padding: 10px;")
+        current_model_layout = QVBoxLayout(current_model_frame)
+        
+        current_model_label = QLabel(f"Current Model: <b>{self.chatbot.model}</b>")
+        current_model_label.setStyleSheet("color: #E9EDF0; font-size: 16px;")
+        
+        # Check if model supports image generation
+        supports_images = self.chatbot.can_generate_images()
+        capabilities_label = QLabel(f"Image Generation: {'✓ Supported' if supports_images else '✗ Not Supported'}")
+        capabilities_label.setStyleSheet(f"color: {'#4CAF50' if supports_images else '#F44336'}; font-size: 14px;")
+        
+        current_model_layout.addWidget(current_model_label)
+        current_model_layout.addWidget(capabilities_label)
+        
+        # Available models list
+        models_label = QLabel("Available Models:")
+        models_label.setStyleSheet("color: #E9EDF0; font-size: 14px; margin-top: 10px;")
+        
+        models_list = QListWidget()
+        models_list.setStyleSheet("""
+            QListWidget {
+                background-color: #1E2428;
+                color: #D1D7DB;
+                border-radius: 4px;
+                padding: 5px;
+                font-size: 14px;
+            }
+            QListWidget::item {
+                padding: 5px;
+                border-bottom: 1px solid #2D383E;
+            }
+            QListWidget::item:selected {
+                background-color: #00A884;
+                color: white;
+            }
+        """)
+        
+        # Populate models list
+        for model in self.chatbot.models:
+            item = QListWidgetItem(model)
+            # Add icon for image-capable models
+            tooltip = ""
+            if model in self.chatbot.model_capabilities:
+                capabilities = self.chatbot.model_capabilities[model]
+                
+                # Set icon based on source
+                source = capabilities.get("source", "")
+                if source == "ollama_api" or source == "ollama_cli":
+                    item.setIcon(QIcon.fromTheme("network-server"))
+                    tooltip = "Ollama model"
+                elif source == "file_scan":
+                    item.setIcon(QIcon.fromTheme("drive-harddisk"))
+                    tooltip = "Local model file"
+                
+                # Add image capability to tooltip
+                if capabilities.get("image_generation", False):
+                    if tooltip:
+                        tooltip += " - "
+                    tooltip += "Supports image generation"
+                    
+                # Add model size to tooltip if available
+                if "size_mb" in capabilities and capabilities["size_mb"] > 0:
+                    size_mb = capabilities["size_mb"]
+                    if size_mb >= 1000:
+                        size_gb = size_mb / 1024
+                        if tooltip:
+                            tooltip += " - "
+                        tooltip += f"Size: {size_gb:.1f} GB"
+                    else:
+                        if tooltip:
+                            tooltip += " - "
+                        tooltip += f"Size: {size_mb:.0f} MB"
+            
+            if tooltip:
+                item.setToolTip(tooltip)
+                
+            # Set current item
+            if model == self.chatbot.model:
+                models_list.setCurrentItem(item)
+                
+            models_list.addItem(item)
+        
+        # Button to switch model
+        switch_model_btn = QPushButton("Switch to Selected Model")
+        switch_model_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #00A884;
+                color: white;
+                border-radius: 4px;
+                padding: 8px;
+                font-size: 14px;
+                font-weight: bold;
+            }
+            QPushButton:hover {
+                background-color: #009673;
+            }
+        """)
+        
+        # Check capabilities button
+        check_capabilities_btn = QPushButton("Check Model Capabilities")
+        check_capabilities_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #607D8B;
+                color: white;
+                border-radius: 4px;
+                padding: 8px;
+                font-size: 14px;
+                font-weight: bold;
+            }
+            QPushButton:hover {
+                background-color: #455A64;
+            }
+        """)
+        
+        # Connect switch model button
+        def switch_model():
+            selected_items = models_list.selectedItems()
+            if selected_items:
+                model_name = selected_items[0].text()
+                self.change_ai_model(model_name)
+                # Update current model info
+                current_model_label.setText(f"Current Model: <b>{self.chatbot.model}</b>")
+                supports_images = self.chatbot.can_generate_images()
+                capabilities_label.setText(f"Image Generation: {'✓ Supported' if supports_images else '✗ Not Supported'}")
+                capabilities_label.setStyleSheet(f"color: {'#4CAF50' if supports_images else '#F44336'}; font-size: 14px;")
+        
+        # Connect check capabilities button
+        def check_model_capabilities():
+            selected_items = models_list.selectedItems()
+            if not selected_items:
+                QMessageBox.warning(dialog, "No Model Selected", "Please select a model to check capabilities.")
+                return
+                
+            model_name = selected_items[0].text()
+            
+            # Create a progress dialog
+            progress_dialog = QDialog(dialog)
+            progress_dialog.setWindowTitle(f"Checking Capabilities: {model_name}")
+            progress_dialog.setMinimumWidth(400)
+            progress_dialog.setMinimumHeight(150)
+            
+            progress_layout = QVBoxLayout(progress_dialog)
+            progress_label = QLabel(f"Checking capabilities of {model_name}...")
+            progress_label.setStyleSheet("color: #E9EDF0; font-size: 14px;")
+            progress_bar = QProgressBar()
+            progress_bar.setRange(0, 0)  # Indeterminate progress
+            progress_bar.setStyleSheet("""
+                QProgressBar {
+                    background-color: #1E2428;
+                    color: white;
+                    border-radius: 4px;
+                    text-align: center;
+                }
+                QProgressBar::chunk {
+                    background-color: #00A884;
+                    border-radius: 4px;
+                }
+            """)
+            
+            progress_layout.addWidget(progress_label)
+            progress_layout.addWidget(progress_bar)
+            
+            # Show progress dialog
+            progress_dialog.show()
+            
+            # Function to check capabilities in a separate thread
+            def perform_check():
+                try:
+                    # Check capabilities with a timeout
+                    result = self.chatbot.check_model_capabilities(model_name)
+                    
+                    # Close progress dialog if it's still open
+                    try:
+                        if progress_dialog and progress_dialog.isVisible():
+                            progress_dialog.accept()
+                    except Exception as dialog_error:
+                        print(f"Error closing progress dialog: {str(dialog_error)}")
+                    
+                    # Always show results dialog, even if there was an issue
+                    capabilities = result.get("capabilities", {"name": model_name})
+                    
+                    # Ensure we have at least the basic fields
+                    if "name" not in capabilities:
+                        capabilities["name"] = model_name
+                    if "check_time" not in capabilities:
+                        capabilities["check_time"] = time.strftime("%Y-%m-%d %H:%M:%S")
+                        
+                    # Show the capabilities dialog
+                    try:
+                        show_capabilities_dialog(model_name, capabilities)
+                    except Exception as dialog_error:
+                        print(f"Error showing capabilities dialog: {str(dialog_error)}")
+                        QMessageBox.warning(
+                            dialog,
+                            "Error Showing Capabilities",
+                            f"Could not display capabilities dialog: {str(dialog_error)}"
+                        )
+                    
+                except Exception as e:
+                    # Handle any unexpected errors
+                    print(f"Error in perform_check: {str(e)}")
+                    
+                    try:
+                        if progress_dialog and progress_dialog.isVisible():
+                            progress_dialog.accept()
+                    except:
+                        pass
+                    
+                    # Create a minimal capabilities object with error info
+                    error_capabilities = {
+                        "name": model_name,
+                        "error": str(e),
+                        "check_time": time.strftime("%Y-%m-%d %H:%M:%S"),
+                        "source": "error"
+                    }
+                    
+                    # Show dialog with the error information or fallback to message box
+                    try:
+                        show_capabilities_dialog(model_name, error_capabilities)
+                    except Exception as dialog_error:
+                        QMessageBox.critical(
+                            dialog,
+                            "Error Checking Capabilities",
+                            f"An error occurred while checking capabilities: {str(e)}\n\nAdditional error: {str(dialog_error)}"
+                        )
+            
+            # Use a timer to allow UI updates
+            QTimer.singleShot(100, perform_check)
+        
+        # Function to show capabilities dialog
+        def show_capabilities_dialog(model_name, capabilities):
+            cap_dialog = QDialog(dialog)
+            cap_dialog.setWindowTitle(f"Capabilities: {model_name}")
+            cap_dialog.setMinimumWidth(600)
+            cap_dialog.setMinimumHeight(500)
+            
+            cap_layout = QVBoxLayout(cap_dialog)
+            
+            # Create a scroll area for capabilities
+            scroll = QScrollArea()
+            scroll.setWidgetResizable(True)
+            scroll.setStyleSheet("background-color: #1E2428;")
+            
+            # Container widget for scroll area
+            scroll_content = QWidget()
+            scroll_layout = QVBoxLayout(scroll_content)
+            
+            # Model name and basic info
+            model_title = QLabel(f"<h2>{model_name}</h2>")
+            model_title.setStyleSheet("color: #E9EDF0; font-weight: bold;")
+            scroll_layout.addWidget(model_title)
+            
+            # Check time info
+            check_time = capabilities.get("check_time", time.strftime("%Y-%m-%d %H:%M:%S"))
+            time_label = QLabel(f"<b>Checked at:</b> {check_time}")
+            time_label.setStyleSheet("color: #E9EDF0; font-size: 12px;")
+            scroll_layout.addWidget(time_label)
+            
+            # Source info
+            source = capabilities.get("source", "Unknown")
+            source_label = QLabel(f"<b>Source:</b> {source}")
+            source_label.setStyleSheet("color: #E9EDF0; font-size: 14px;")
+            scroll_layout.addWidget(source_label)
+            
+            # Display any errors that occurred during capability checking
+            if "error" in capabilities:
+                error_frame = QFrame()
+                error_frame.setFrameShape(QFrame.StyledPanel)
+                error_frame.setStyleSheet("background-color: #5A1E1E; border-radius: 8px; padding: 10px;")
+                error_layout = QVBoxLayout(error_frame)
+                
+                error_title = QLabel("<b>Error During Capability Check:</b>")
+                error_title.setStyleSheet("color: #FF6B6B; font-size: 14px;")
+                error_layout.addWidget(error_title)
+                
+                error_msg = QLabel(capabilities["error"])
+                error_msg.setWordWrap(True)
+                error_msg.setStyleSheet("color: #FFB6B6; font-size: 13px;")
+                error_layout.addWidget(error_msg)
+                
+                error_note = QLabel("Note: Some capability information may still be available.")
+                error_note.setStyleSheet("color: #FFB6B6; font-size: 12px; font-style: italic;")
+                error_layout.addWidget(error_note)
+                
+                scroll_layout.addWidget(error_frame)
+                
+            # Display API errors if they occurred
+            if "api_error" in capabilities:
+                api_error_label = QLabel(f"<b>API Error:</b> {capabilities['api_error']}")
+                api_error_label.setWordWrap(True)
+                api_error_label.setStyleSheet("color: #FF9800; font-size: 13px;")
+                scroll_layout.addWidget(api_error_label)
+                
+            # Display query errors if they occurred
+            if "query_error" in capabilities:
+                query_error_label = QLabel(f"<b>Query Error:</b> {capabilities['query_error']}")
+                query_error_label.setWordWrap(True)
+                query_error_label.setStyleSheet("color: #FF9800; font-size: 13px;")
+                scroll_layout.addWidget(query_error_label)
+            
+            # Add separator
+            separator = QFrame()
+            separator.setFrameShape(QFrame.HLine)
+            separator.setFrameShadow(QFrame.Sunken)
+            separator.setStyleSheet("background-color: #2D383E;")
+            scroll_layout.addWidget(separator)
+            
+            # Basic capabilities section
+            try:
+                basic_cap_label = QLabel("<h3>Basic Capabilities</h3>")
+                basic_cap_label.setStyleSheet("color: #E9EDF0; margin-top: 10px;")
+                scroll_layout.addWidget(basic_cap_label)
+                
+                # Create a grid for basic capabilities
+                basic_grid = QGridLayout()
+                basic_grid.setColumnStretch(1, 1)
+                
+                # Row counter for grid
+                row = 0
+                
+                # Image generation
+                try:
+                    img_gen = capabilities.get("image_generation", False)
+                    img_gen_label = QLabel("Image Generation:")
+                    img_gen_label.setStyleSheet("color: #E9EDF0; font-size: 14px;")
+                    img_gen_value = QLabel("✓ Supported" if img_gen else "✗ Not Supported")
+                    img_gen_value.setStyleSheet(f"color: {'#4CAF50' if img_gen else '#F44336'}; font-size: 14px;")
+                    basic_grid.addWidget(img_gen_label, row, 0)
+                    basic_grid.addWidget(img_gen_value, row, 1)
+                    row += 1
+                except Exception as e:
+                    print(f"Error displaying image generation capability: {str(e)}")
+                
+                # Vision capability
+                try:
+                    vision = capabilities.get("vision_capable", False)
+                    vision_label = QLabel("Vision/Image Understanding:")
+                    vision_label.setStyleSheet("color: #E9EDF0; font-size: 14px;")
+                    vision_value = QLabel("✓ Supported" if vision else "✗ Not Supported")
+                    vision_value.setStyleSheet(f"color: {'#4CAF50' if vision else '#F44336'}; font-size: 14px;")
+                    basic_grid.addWidget(vision_label, row, 0)
+                    basic_grid.addWidget(vision_value, row, 1)
+                    row += 1
+                except Exception as e:
+                    print(f"Error displaying vision capability: {str(e)}")
+                
+                # Model family if available
+                try:
+                    if "model_family" in capabilities:
+                        family_label = QLabel("Model Family:")
+                        family_label.setStyleSheet("color: #E9EDF0; font-size: 14px;")
+                        family_value = QLabel(str(capabilities["model_family"]))
+                        family_value.setStyleSheet("color: #E9EDF0; font-size: 14px;")
+                        basic_grid.addWidget(family_label, row, 0)
+                        basic_grid.addWidget(family_value, row, 1)
+                        row += 1
+                except Exception as e:
+                    print(f"Error displaying model family: {str(e)}")
+                
+                # Model type if available
+                try:
+                    if "model_type" in capabilities:
+                        model_type_label = QLabel("Model Type:")
+                        model_type_label.setStyleSheet("color: #E9EDF0; font-size: 14px;")
+                        model_type_value = QLabel(str(capabilities["model_type"]))
+                        model_type_value.setStyleSheet("color: #E9EDF0; font-size: 14px;")
+                        basic_grid.addWidget(model_type_label, row, 0)
+                        basic_grid.addWidget(model_type_value, row, 1)
+                        row += 1
+                except Exception as e:
+                    print(f"Error displaying model type: {str(e)}")
+                
+                # Size information
+                try:
+                    size_label = QLabel("Model Size:")
+                    size_label.setStyleSheet("color: #E9EDF0; font-size: 14px;")
+                    
+                    size_mb = capabilities.get("size_mb", 0)
+                    if size_mb and size_mb >= 1000 and "size_gb" in capabilities:
+                        size_text = f"{capabilities['size_gb']:.2f} GB"
+                    elif size_mb and size_mb > 0:
+                        size_text = f"{size_mb:.0f} MB"
+                    else:
+                        size_text = "Unknown"
+                        
+                    size_value = QLabel(size_text)
+                    size_value.setStyleSheet("color: #E9EDF0; font-size: 14px;")
+                    basic_grid.addWidget(size_label, row, 0)
+                    basic_grid.addWidget(size_value, row, 1)
+                    row += 1
+                except Exception as e:
+                    print(f"Error displaying size information: {str(e)}")
+                
+                # Base model if available
+                try:
+                    if "base_model" in capabilities and capabilities["base_model"]:
+                        base_model_label = QLabel("Base Model:")
+                        base_model_label.setStyleSheet("color: #E9EDF0; font-size: 14px;")
+                        base_model_value = QLabel(str(capabilities["base_model"]))
+                        base_model_value.setStyleSheet("color: #E9EDF0; font-size: 14px;")
+                        basic_grid.addWidget(base_model_label, row, 0)
+                        basic_grid.addWidget(base_model_value, row, 1)
+                        row += 1
+                except Exception as e:
+                    print(f"Error displaying base model: {str(e)}")
+                    
+                # License if available
+                try:
+                    if "license" in capabilities and capabilities["license"]:
+                        license_label = QLabel("License:")
+                        license_label.setStyleSheet("color: #E9EDF0; font-size: 14px;")
+                        license_value = QLabel(str(capabilities["license"]))
+                        license_value.setStyleSheet("color: #E9EDF0; font-size: 14px;")
+                        basic_grid.addWidget(license_label, row, 0)
+                        basic_grid.addWidget(license_value, row, 1)
+                        row += 1
+                except Exception as e:
+                    print(f"Error displaying license: {str(e)}")
+            except Exception as e:
+                print(f"Error setting up basic capabilities section: {str(e)}")
+                # Add a fallback message if the grid setup fails
+                fallback_label = QLabel("Could not display basic capabilities due to an error.")
+                fallback_label.setStyleSheet("color: #FF9800; font-size: 14px;")
+                scroll_layout.addWidget(fallback_label)
+            
+            # Add basic grid to layout
+            scroll_layout.addLayout(basic_grid)
+            
+            # Add separator
+            separator2 = QFrame()
+            separator2.setFrameShape(QFrame.HLine)
+            separator2.setFrameShadow(QFrame.Sunken)
+            separator2.setStyleSheet("background-color: #2D383E;")
+            scroll_layout.addWidget(separator2)
+            
+            # Advanced capabilities section
+            try:
+                if "parameters" in capabilities and capabilities["parameters"]:
+                    # Ensure parameters is a dictionary
+                    if isinstance(capabilities["parameters"], dict) and capabilities["parameters"]:
+                        adv_cap_label = QLabel("<h3>Model Parameters</h3>")
+                        adv_cap_label.setStyleSheet("color: #E9EDF0; margin-top: 10px;")
+                        scroll_layout.addWidget(adv_cap_label)
+                        
+                        # Create a table for parameters
+                        params_table = QTableWidget()
+                        params_table.setColumnCount(2)
+                        params_table.setHorizontalHeaderLabels(["Parameter", "Value"])
+                        params_table.horizontalHeader().setStretchLastSection(True)
+                        params_table.setStyleSheet("""
+                            QTableWidget {
+                                background-color: #1E2428;
+                                color: #D1D7DB;
+                                border: none;
+                            }
+                            QHeaderView::section {
+                                background-color: #2A3942;
+                                color: #E9EDF0;
+                                padding: 5px;
+                                border: none;
+                            }
+                            QTableWidget::item {
+                                padding: 5px;
+                            }
+                        """)
+                        
+                        # Add parameters to table
+                        try:
+                            params = capabilities["parameters"]
+                            params_table.setRowCount(len(params))
+                            row = 0
+                            for param, value in params.items():
+                                try:
+                                    # Convert param and value to strings to avoid any type issues
+                                    param_str = str(param) if param is not None else "unknown"
+                                    value_str = str(value) if value is not None else "unknown"
+                                    
+                                    # Create table items
+                                    param_item = QTableWidgetItem(param_str)
+                                    value_item = QTableWidgetItem(value_str)
+                                    
+                                    # Add to table
+                                    params_table.setItem(row, 0, param_item)
+                                    params_table.setItem(row, 1, value_item)
+                                    row += 1
+                                except Exception as item_error:
+                                    print(f"Error adding parameter item: {str(item_error)}")
+                                    continue
+                            
+                            # Resize table to fit content
+                            params_table.resizeColumnsToContents()
+                            params_table.setMinimumHeight(min(200, row * 30 + 40))  # Limit height
+                            
+                            scroll_layout.addWidget(params_table)
+                        except Exception as params_error:
+                            print(f"Error populating parameters table: {str(params_error)}")
+                            params_error_label = QLabel("Could not display parameters due to an error.")
+                            params_error_label.setStyleSheet("color: #FF9800; font-size: 13px;")
+                            scroll_layout.addWidget(params_error_label)
+            except Exception as e:
+                print(f"Error setting up parameters section: {str(e)}")
+            
+            # Self-reported capabilities
+            try:
+                if "self_reported" in capabilities and capabilities["self_reported"]:
+                    # Ensure self_reported is a string
+                    if capabilities["self_reported"]:
+                        self_report_label = QLabel("<h3>Self-Reported Capabilities</h3>")
+                        self_report_label.setStyleSheet("color: #E9EDF0; margin-top: 10px;")
+                        scroll_layout.addWidget(self_report_label)
+                        
+                        self_report_text = QTextEdit()
+                        self_report_text.setReadOnly(True)
+                        
+                        # Convert to string if needed
+                        self_report_content = str(capabilities["self_reported"])
+                        self_report_text.setPlainText(self_report_content)
+                        
+                        self_report_text.setStyleSheet("""
+                            QTextEdit {
+                                background-color: #1E2428;
+                                color: #D1D7DB;
+                                border: none;
+                                padding: 5px;
+                                font-size: 14px;
+                            }
+                        """)
+                        self_report_text.setMaximumHeight(100)
+                        
+                        scroll_layout.addWidget(self_report_text)
+            except Exception as e:
+                print(f"Error displaying self-reported capabilities: {str(e)}")
+                try:
+                    # Add a fallback message
+                    self_report_error = QLabel("Could not display self-reported capabilities due to an error.")
+                    self_report_error.setStyleSheet("color: #FF9800; font-size: 13px;")
+                    scroll_layout.addWidget(self_report_error)
+                except:
+                    pass
+            
+            # Set scroll content and add to layout
+            scroll.setWidget(scroll_content)
+            cap_layout.addWidget(scroll)
+            
+            # Close button
+            close_btn = QPushButton("Close")
+            close_btn.setStyleSheet("""
+                QPushButton {
+                    background-color: #607D8B;
+                    color: white;
+                    border-radius: 4px;
+                    padding: 8px;
+                    font-size: 14px;
+                }
+                QPushButton:hover {
+                    background-color: #455A64;
+                }
+            """)
+            close_btn.clicked.connect(cap_dialog.accept)
+            
+            cap_layout.addWidget(close_btn)
+            
+            # Show dialog
+            cap_dialog.exec_()
+        
+        switch_model_btn.clicked.connect(switch_model)
+        check_capabilities_btn.clicked.connect(check_model_capabilities)
+        
+        # Button layout
+        button_layout = QHBoxLayout()
+        button_layout.addWidget(switch_model_btn)
+        button_layout.addWidget(check_capabilities_btn)
+        
+        # Add widgets to model tab
+        model_layout.addWidget(current_model_frame)
+        model_layout.addWidget(models_label)
+        model_layout.addWidget(models_list)
+        model_layout.addLayout(button_layout)
+        
+        # Scan for local models tab
+        scan_layout = QVBoxLayout(scan_tab)
+        
+        # Scan instructions
+        scan_info = QLabel("Scan your system for local AI models. This will search common directories where models are stored.")
+        scan_info.setWordWrap(True)
+        scan_info.setStyleSheet("color: #E9EDF0; font-size: 14px;")
+        
+        # Custom path input
+        custom_path_layout = QHBoxLayout()
+        custom_path_label = QLabel("Custom Path:")
+        custom_path_label.setStyleSheet("color: #E9EDF0; font-size: 14px;")
+        custom_path_input = QLineEdit()
+        custom_path_input.setPlaceholderText("Optional: Enter a custom directory to scan")
+        custom_path_input.setStyleSheet("""
+            QLineEdit {
+                background-color: #1E2428;
+                color: #D1D7DB;
+                border-radius: 4px;
+                padding: 8px;
+                font-size: 14px;
+            }
+        """)
+        browse_btn = QPushButton("Browse")
+        browse_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #607D8B;
+                color: white;
+                border-radius: 4px;
+                padding: 8px;
+                font-size: 14px;
+            }
+            QPushButton:hover {
+                background-color: #455A64;
+            }
+        """)
+        
+        # Connect browse button
+        def browse_directory():
+            dir_path = QFileDialog.getExistingDirectory(dialog, "Select Directory to Scan")
+            if dir_path:
+                custom_path_input.setText(dir_path)
+        
+        browse_btn.clicked.connect(browse_directory)
+        
+        custom_path_layout.addWidget(custom_path_label)
+        custom_path_layout.addWidget(custom_path_input)
+        custom_path_layout.addWidget(browse_btn)
+        
+        # Scan results
+        scan_results_label = QLabel("Scan Results:")
+        scan_results_label.setStyleSheet("color: #E9EDF0; font-size: 14px; margin-top: 10px;")
+        
+        scan_results = QTextEdit()
+        scan_results.setReadOnly(True)
+        scan_results.setStyleSheet("""
+            QTextEdit {
+                background-color: #1E2428;
+                color: #D1D7DB;
+                border-radius: 4px;
+                padding: 5px;
+                font-size: 14px;
+                font-family: monospace;
+            }
+        """)
+        
+        # Progress bar
+        scan_progress = QProgressBar()
+        scan_progress.setRange(0, 100)
+        scan_progress.setValue(0)
+        scan_progress.setVisible(False)
+        scan_progress.setStyleSheet("""
+            QProgressBar {
+                background-color: #1E2428;
+                color: white;
+                border-radius: 4px;
+                text-align: center;
+            }
+            QProgressBar::chunk {
+                background-color: #00A884;
+                border-radius: 4px;
+            }
+        """)
+        
+        # Scan button
+        scan_btn = QPushButton("Scan for Local Models")
+        scan_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #00A884;
+                color: white;
+                border-radius: 4px;
+                padding: 8px;
+                font-size: 14px;
+                font-weight: bold;
+            }
+            QPushButton:hover {
+                background-color: #009673;
+            }
+        """)
+        
+        # Connect scan button
+        def scan_for_models():
+            # Update UI
+            scan_btn.setEnabled(False)
+            scan_results.clear()
+            scan_progress.setVisible(True)
+            scan_progress.setValue(10)
+            scan_results.append("Scanning for local AI models...\n")
+            
+            # Get custom path if provided
+            custom_path = custom_path_input.text().strip()
+            if custom_path and os.path.exists(custom_path):
+                self.chatbot.local_model_paths.append(custom_path)
+                scan_results.append(f"Added custom path: {custom_path}\n")
+            
+            # Use a timer to allow UI updates
+            def perform_scan():
+                # Clear existing models
+                old_models = set(self.chatbot.models)
+                scan_progress.setValue(30)
+                
+                # Scan for models
+                self.chatbot.scan_local_model_directories()
+                scan_progress.setValue(70)
+                
+                # Update models list
+                models_list.clear()
+                for model in self.chatbot.models:
+                    item = QListWidgetItem(model)
+                    if model in self.chatbot.model_capabilities and self.chatbot.model_capabilities[model].get("image_generation", False):
+                        item.setIcon(QIcon.fromTheme("image"))
+                        item.setToolTip("Supports image generation")
+                    models_list.setCurrentItem(item) if model == self.chatbot.model else None
+                    models_list.addItem(item)
+                
+                # Show results
+                scan_progress.setValue(90)
+                new_models = set(self.chatbot.models) - old_models
+                scan_results.append(f"Scan complete! Found {len(self.chatbot.models)} models in total.\n")
+                
+                # Group models by source
+                ollama_models = []
+                local_file_models = []
+                other_models = []
+                
+                for model in self.chatbot.models:
+                    if model in self.chatbot.model_capabilities:
+                        source = self.chatbot.model_capabilities[model].get("source", "")
+                        if source in ["ollama_api", "ollama_cli"]:
+                            ollama_models.append(model)
+                        elif source == "file_scan":
+                            local_file_models.append(model)
+                        else:
+                            other_models.append(model)
+                
+                # Display newly discovered models with more details
+                if new_models:
+                    scan_results.append("Newly discovered models:")
+                    for model in sorted(new_models):
+                        model_info = ""
+                        if model in self.chatbot.model_capabilities:
+                            capabilities = self.chatbot.model_capabilities[model]
+                            
+                            # Add source info
+                            source = capabilities.get("source", "")
+                            if source == "ollama_api":
+                                model_info += " [Ollama API]"
+                            elif source == "ollama_cli":
+                                model_info += " [Ollama CLI]"
+                            elif source == "file_scan":
+                                model_info += " [Local File]"
+                                
+                                # Add path for file-based models
+                                if "local_path" in capabilities:
+                                    model_info += f" - {capabilities['local_path']}"
+                            
+                            # Add image generation capability
+                            if capabilities.get("image_generation", False):
+                                model_info += " ✓ Images"
+                            
+                            # Add size info if available
+                            if "size_mb" in capabilities and capabilities["size_mb"] > 0:
+                                size_mb = capabilities["size_mb"]
+                                if size_mb >= 1000:
+                                    size_gb = size_mb / 1024
+                                    model_info += f" - {size_gb:.1f} GB"
+                                else:
+                                    model_info += f" - {size_mb:.0f} MB"
+                        
+                        scan_results.append(f"- {model}{model_info}")
+                else:
+                    scan_results.append("No new models discovered.")
+                
+                # Display summary by source
+                scan_results.append("\nModel Summary:")
+                if ollama_models:
+                    scan_results.append(f"- Ollama Models: {len(ollama_models)}")
+                if local_file_models:
+                    scan_results.append(f"- Local File Models: {len(local_file_models)}")
+                if other_models:
+                    scan_results.append(f"- Other Models: {len(other_models)}")
+                
+                # Reset UI
+                scan_progress.setValue(100)
+                scan_btn.setEnabled(True)
+                
+                # Use a timer to hide progress bar after a delay
+                QTimer.singleShot(2000, lambda: scan_progress.setVisible(False))
+            
+            # Use a timer to allow UI updates
+            QTimer.singleShot(100, perform_scan)
+        
+        scan_btn.clicked.connect(scan_for_models)
+        
+        # Add widgets to scan tab
+        scan_layout.addWidget(scan_info)
+        scan_layout.addLayout(custom_path_layout)
+        scan_layout.addWidget(scan_results_label)
+        scan_layout.addWidget(scan_results)
+        scan_layout.addWidget(scan_progress)
+        scan_layout.addWidget(scan_btn)
+        
+        # Add tabs to tab widget
+        tabs.addTab(model_tab, "Model Selection")
+        tabs.addTab(scan_tab, "Scan for Models")
+        
+        # Add tab widget to main layout
+        layout.addWidget(tabs)
+        
+        # Close button
+        close_btn = QPushButton("Close")
+        close_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #607D8B;
+                color: white;
+                border-radius: 4px;
+                padding: 8px;
+                font-size: 14px;
+            }
+            QPushButton:hover {
+                background-color: #455A64;
+            }
+        """)
+        close_btn.clicked.connect(dialog.accept)
+        
+        layout.addWidget(close_btn)
+        
+        # Show dialog
+        dialog.exec_()
     
+    def generate_ai_image(self, prompt, size, dialog):
+        """Generate an image using the AI model"""
+        # Set processing state
+        self.set_processing_state(True)
+        
+        # Add user message with the prompt
+        self.add_user_message(f"Generate an image: {prompt}")
+        
+        # Generate the image
+        img_path, error = self.chatbot.generate_image(prompt, size)
+        
+        if img_path:
+            # Add the generated image to the chat
+            self.add_image_message(img_path, f"AI generated image: {prompt}", is_user=False)
+            # Close the dialog
+            dialog.accept()
+        else:
+            # Show error message
+            error_msg = error if error else "Failed to generate image. Please try again."
+            self.add_system_message(error_msg, is_error=True)
+            # Update dialog to show error
+            dialog.findChild(QLabel, "progress_label").setText("Error: " + error_msg)
+            dialog.findChild(QLabel, "progress_label").setStyleSheet("color: red;")
+            dialog.findChild(QProgressBar).setVisible(False)
+            dialog.findChild(QPushButton, "generate_btn").setEnabled(True)
+            dialog.findChild(QTextEdit).setEnabled(True)
+            dialog.findChild(QComboBox).setEnabled(True)
+        
+        # Reset processing state
+        self.set_processing_state(False)
+        
     def analyze_image(self, image_path):
         """Analyze an image using AI"""
-        # Add a system message indicating analysis is in progress
-        system_msg = "Analyzing image..."
-        self.add_system_message(system_msg)
-        
-        # If using online API and it's available, use it for image analysis
-        if self.chatbot.use_online_api and self.chatbot.online_api.available:
-            # For now, just add a placeholder response
-            response = "I'm analyzing this image using online AI. This feature would use the API's image analysis capabilities."
-            self.add_ai_message(response)
-            return
-        
-        # If using local Ollama, we need to describe the image first
         try:
-            # Use a basic image description approach
+            # Check if OpenCV is available
             import cv2
             import numpy as np
             
-            # Load image
+            # Read the image
             img = cv2.imread(image_path)
             if img is None:
-                self.add_system_message("Failed to load image", is_error=True)
+                self.add_system_message(f"Error: Could not read image {image_path}", is_error=True)
                 return
-                
+            
             # Get basic image info
             height, width, channels = img.shape
+            image_info = f"Image dimensions: {width}x{height}, {channels} channels"            
             
-            # Create a basic description
-            description = f"This is an image of size {width}x{height} pixels. "
+            # Prepare prompt for AI
+            prompt = f"I've uploaded an image. Please describe what you see in this image. {image_info}"
             
-            # Analyze colors
-            avg_color = np.mean(img, axis=(0, 1))
-            b, g, r = avg_color  # OpenCV uses BGR
-            
-            # Determine dominant color
-            if r > g and r > b:
-                dominant = "red"
-            elif g > r and g > b:
-                dominant = "green"
-            elif b > r and b > g:
-                dominant = "blue"
-            else:
-                dominant = "grayscale"
-                
-            description += f"The dominant color appears to be {dominant}. "
-            
-            # Check if image is dark or bright
-            brightness = np.mean(img)
-            if brightness < 85:
-                description += "The image is relatively dark. "
-            elif brightness > 170:
-                description += "The image is relatively bright. "
-            else:
-                description += "The image has moderate brightness. "
-                
-            # Generate a prompt for the AI
-            prompt = f"I'm looking at an image with the following basic properties: {description}. Can you provide some insights or ask me questions about what might be in this image?"
+            # Set processing state
+            self.set_processing_state(True)
             
             # Get AI response
-            response = self.chatbot.generate_response(prompt)
+            system_prompt = "You are a helpful assistant that can analyze images. Describe what you see in the image based on the information provided."
+            response = self.chatbot.generate_response(prompt, system_prompt)
+            
+            # Add AI response
             self.add_ai_message(response)
             
+        except ImportError:
+            self.add_system_message("OpenCV is not installed. Cannot analyze image.", is_error=True)
+            self.add_ai_message("I see you've shared an image, but I don't have the necessary libraries installed to analyze it in detail. If you'd like me to comment on this image, please describe what it shows.")
         except Exception as e:
-            error_msg = f"Error analyzing image: {str(e)}"
-            self.add_system_message(error_msg, is_error=True)
+            self.add_system_message(f"Error analyzing image: {str(e)}", is_error=True)
+        finally:
+            # Reset processing state
+            self.set_processing_state(False)
+    
+    def add_image_message(self, image_path, caption=""):
+        """Add an image message to the chat"""
+        # Create conversation if none exists
+        if not self.current_conversation_id:
+            self.new_conversation()
+        
+        # Add to database
+        if self.current_conversation_id:
+            self.db.add_message(self.current_conversation_id, "user", caption, image_path)
+        
+        # Legacy: Add to history manager
+        self.chat_history_manager.add_message("user", caption, image_path)
+        
+        # Add to UI
+        image_bubble = ImageMessageBubble(image_path, caption, is_user=True)
+        self.chat_layout.addWidget(image_bubble)
+        
+        # Scroll to bottom
+        QApplication.processEvents()  # Force update to get correct scroll height
+        scroll_area = self.chat_container.parent()
+        if hasattr(scroll_area, 'verticalScrollBar'):
+            scroll_area.verticalScrollBar().setValue(
+                scroll_area.verticalScrollBar().maximum()
+            )
     
     def add_user_message(self, content):
         """Add a user message to the chat"""
-        # Create and add message bubble
+        # Create conversation if none exists
+        if not self.current_conversation_id:
+            self.new_conversation()
+        
+        # Add to database
+        if self.current_conversation_id:
+            self.db.add_message(self.current_conversation_id, "user", content)
+        
+        # Legacy: Add to history manager
+        self.chat_history_manager.add_message("user", content)
+        
+        # Add to UI
         message_bubble = MessageBubble(content, is_user=True)
         self.chat_layout.addWidget(message_bubble)
-        
-        # Save to history
-        self.chat_history_manager.add_message("user", content)
         
         # Scroll to bottom
         QApplication.processEvents()  # Force update to get correct scroll height
@@ -1823,12 +4029,20 @@ class ChatMateApp(QMainWindow):
     
     def add_ai_message(self, content):
         """Add an AI message to the chat"""
-        # Create and add message bubble
+        # Create conversation if none exists
+        if not self.current_conversation_id:
+            self.new_conversation()
+        
+        # Add to database
+        if self.current_conversation_id:
+            self.db.add_message(self.current_conversation_id, "ai", content)
+        
+        # Legacy: Add to history manager
+        self.chat_history_manager.add_message("ai", content)
+        
+        # Add to UI
         message_bubble = MessageBubble(content, is_user=False)
         self.chat_layout.addWidget(message_bubble)
-        
-        # Save to history
-        self.chat_history_manager.add_message("ai", content)
         
         # Scroll to bottom
         QApplication.processEvents()  # Force update to get correct scroll height
@@ -1840,12 +4054,20 @@ class ChatMateApp(QMainWindow):
     
     def add_system_message(self, content, is_error=False):
         """Add a system message to the chat"""
-        # Create and add message bubble
-        message_bubble = SystemMessageBubble(content, is_error)
-        self.chat_layout.addWidget(message_bubble)
+        # Create conversation if none exists
+        if not self.current_conversation_id:
+            self.new_conversation()
         
-        # Save to history
+        # Add to database
+        if self.current_conversation_id:
+            self.db.add_message(self.current_conversation_id, "system", content)
+        
+        # Legacy: Add to history manager
         self.chat_history_manager.add_message("system", content)
+        
+        # Add to UI
+        system_bubble = SystemMessageBubble(content, is_error)
+        self.chat_layout.addWidget(system_bubble)
         
         # Scroll to bottom
         QApplication.processEvents()  # Force update to get correct scroll height
@@ -1855,14 +4077,166 @@ class ChatMateApp(QMainWindow):
                 scroll_area.verticalScrollBar().maximum()
             )
     
-    def add_image_message(self, image_path, caption=""):
-        """Add an image message to the chat"""
-        # Create and add image bubble
-        image_bubble = ImageMessageBubble(image_path, caption, is_user=True)
-        self.chat_layout.addWidget(image_bubble)
+    def load_conversations(self):
+        """Load conversations from database"""
+        self.conversations = self.db.get_conversations()
         
-        # Save to history
-        self.chat_history_manager.add_message("user", caption if caption else "[Image]", image_path)
+        # Update conversation selector
+        if hasattr(self, 'conversation_selector'):
+            self.conversation_selector.clear()
+            
+            for conversation in self.conversations:
+                title = conversation["title"]
+                self.conversation_selector.addItem(title, conversation["id"])
+            
+            # Add "New Conversation" option
+            self.conversation_selector.addItem("+ New Conversation", -1)
+            
+            # Select first conversation or create new one if none exists
+            if self.conversations:
+                self.current_conversation_id = self.conversations[0]["id"]
+                self.conversation_selector.setCurrentIndex(0)
+                self.chatbot.current_mood = self.conversations[0]["ai_mood"]
+                self.update_mood_indicator()
+            else:
+                self.new_conversation()
+    
+    def new_conversation(self):
+        """Create a new conversation"""
+        title = f"Conversation {len(self.conversations) + 1}"
+        conversation_id = self.db.create_conversation(title, self.chatbot.current_mood)
+        
+        if conversation_id:
+            self.current_conversation_id = conversation_id
+            
+            # Add to conversations list
+            self.conversations.insert(0, {
+                "id": conversation_id,
+                "title": title,
+                "created_at": datetime.now().isoformat(),
+                "updated_at": datetime.now().isoformat(),
+                "ai_mood": self.chatbot.current_mood
+            })
+            
+            # Update selector
+            self.conversation_selector.blockSignals(True)
+            self.conversation_selector.insertItem(0, title, conversation_id)
+            self.conversation_selector.setCurrentIndex(0)
+            self.conversation_selector.blockSignals(False)
+            
+            # Clear chat display
+            self.clear_chat_display()
+            
+            # Add welcome message
+            self.add_system_message(f"New conversation started with {AI_MOODS[self.chatbot.current_mood]['name']} mood.")
+    
+    def change_conversation(self, index):
+        """Change to a different conversation"""
+        conversation_id = self.conversation_selector.itemData(index)
+        
+        # If "New Conversation" selected
+        if conversation_id == -1:
+            self.new_conversation()
+            return
+        
+        # Set current conversation
+        self.current_conversation_id = conversation_id
+        
+        # Find conversation in list
+        for conversation in self.conversations:
+            if conversation["id"] == conversation_id:
+                # Update AI mood
+                self.chatbot.current_mood = conversation["ai_mood"]
+                
+                # Update mood selector
+                mood_index = self.mood_selector.findData(conversation["ai_mood"])
+                if mood_index >= 0:
+                    self.mood_selector.blockSignals(True)
+                    self.mood_selector.setCurrentIndex(mood_index)
+                    self.mood_selector.blockSignals(False)
+                    self.update_mood_indicator()
+                break
+        
+        # Display messages
+        self.display_conversation_messages()
+    
+    def delete_current_conversation(self):
+        """Delete the current conversation"""
+        if not self.current_conversation_id:
+            return
+            
+        # Confirm deletion
+        reply = QMessageBox.question(
+            self, 
+            "Delete Conversation", 
+            "Are you sure you want to delete this conversation? This cannot be undone.",
+            QMessageBox.Yes | QMessageBox.No, 
+            QMessageBox.No
+        )
+        
+        if reply == QMessageBox.Yes:
+            # Delete from database
+            success = self.db.delete_conversation(self.current_conversation_id)
+            
+            if success:
+                # Remove from selector
+                current_index = self.conversation_selector.currentIndex()
+                self.conversation_selector.removeItem(current_index)
+                
+                # Remove from list
+                self.conversations = [c for c in self.conversations if c["id"] != self.current_conversation_id]
+                
+                # Select another conversation or create new one
+                if self.conversations:
+                    # Select the next available conversation
+                    if current_index >= len(self.conversations):
+                        current_index = 0
+                    self.conversation_selector.setCurrentIndex(current_index)
+                else:
+                    self.new_conversation()
+    
+    def clear_chat_display(self):
+        """Clear the chat display without affecting the database"""
+        # Clear existing widgets
+        while self.chat_layout.count():
+            item = self.chat_layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+    
+    def display_conversation_messages(self):
+        """Display messages for the current conversation"""
+        if not self.current_conversation_id:
+            return
+            
+        # Clear display
+        self.clear_chat_display()
+        
+        # Get messages from database
+        messages = self.db.get_messages(self.current_conversation_id)
+        
+        # Add messages to display
+        for message in messages:
+            role = message.get("role", "system")
+            content = message.get("content", "")
+            image_path = message.get("image_path")
+            
+            if role == "user":
+                if image_path and os.path.exists(image_path):
+                    # Image message
+                    image_bubble = ImageMessageBubble(image_path, content, is_user=True)
+                    self.chat_layout.addWidget(image_bubble)
+                else:
+                    # Regular text message
+                    message_bubble = MessageBubble(content, is_user=True)
+                    self.chat_layout.addWidget(message_bubble)
+            elif role == "ai":
+                message_bubble = MessageBubble(content, is_user=False)
+                self.chat_layout.addWidget(message_bubble)
+            elif role == "system":
+                # Determine if it's an error message
+                is_error = "error" in content.lower() or "failed" in content.lower()
+                system_bubble = SystemMessageBubble(content, is_error)
+                self.chat_layout.addWidget(system_bubble)
         
         # Scroll to bottom
         QApplication.processEvents()  # Force update to get correct scroll height
@@ -1873,31 +4247,28 @@ class ChatMateApp(QMainWindow):
             )
     
     def display_chat_history(self):
-        """Display the chat history"""
-        history = self.chat_history_manager.get_history()
-        
-        if not history:
+        """Display the chat history (legacy method)"""
+        # If we have a current conversation, use that instead
+        if self.current_conversation_id:
+            self.display_conversation_messages()
             return
             
+        # Legacy code for JSON-based history
         # Clear existing widgets
         while self.chat_layout.count():
             item = self.chat_layout.takeAt(0)
             if item.widget():
                 item.widget().deleteLater()
         
-        # Add system message indicating history is loading
-        system_bubble = SystemMessageBubble("Loading previous chat history...")
-        self.chat_layout.addWidget(system_bubble)
-        
         # Add messages from history
-        for message in history:
-            role = message.get("role")
-            content = message.get("content")
+        for message in self.chat_history_manager.get_history():
+            role = message.get("role", "system")
+            content = message.get("content", "")
             image_path = message.get("image_path")
             
             if role == "user":
-                if image_path:
-                    # This is an image message
+                if image_path and os.path.exists(image_path):
+                    # Image message
                     image_bubble = ImageMessageBubble(image_path, content, is_user=True)
                     self.chat_layout.addWidget(image_bubble)
                 else:
@@ -1923,16 +4294,29 @@ class ChatMateApp(QMainWindow):
     
     def clear_chat_history(self):
         """Clear the chat history"""
-        self.chat_history_manager.clear_history()
-        
-        # Clear existing widgets
-        while self.chat_layout.count():
-            item = self.chat_layout.takeAt(0)
-            if item.widget():
-                item.widget().deleteLater()
-        
-        # Add system message
-        self.add_system_message("Chat history cleared.")
+        if self.current_conversation_id:
+            # Delete all messages for this conversation
+            cursor = self.db.conn.cursor()
+            cursor.execute("DELETE FROM messages WHERE conversation_id = ?", (self.current_conversation_id,))
+            self.db.conn.commit()
+            
+            # Clear display
+            self.clear_chat_display()
+            
+            # Add system message
+            self.add_system_message("Chat history cleared.")
+        else:
+            # Legacy: Clear JSON-based history
+            self.chat_history_manager.clear_history()
+            
+            # Clear existing widgets
+            while self.chat_layout.count():
+                item = self.chat_layout.takeAt(0)
+                if item.widget():
+                    item.widget().deleteLater()
+            
+            # Add system message
+            self.add_system_message("Chat history cleared.")
     
     def send_message(self):
         """Send a message to the AI"""
@@ -1966,8 +4350,9 @@ class ChatMateApp(QMainWindow):
                     system_msg = "Failed to reconnect. Remaining in offline mode."
                     self.add_system_message(system_msg, is_error=True)
             else:
-                # Get response from AI
-                response = self.chatbot.generate_response(message)
+                # Get response from AI using the current mood's system prompt
+                system_prompt = AI_MOODS[self.chatbot.current_mood]["system_prompt"]
+                response = self.chatbot.generate_response(message, system_prompt)
                 
                 # Add AI response to chat
                 self.add_ai_message(response)
@@ -2002,6 +4387,11 @@ class ChatMateApp(QMainWindow):
     def closeEvent(self, event):
         """Handle window close event"""
         self.save_todos()
+        
+        # Close database connection
+        if hasattr(self, 'db'):
+            self.db.close()
+            
         event.accept()
 
 def main():
